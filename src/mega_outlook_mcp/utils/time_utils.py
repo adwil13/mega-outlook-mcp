@@ -44,6 +44,47 @@ def outlook_restrict_format(dt: datetime) -> str:
     return to_local(dt).strftime("%m/%d/%Y %I:%M %p")
 
 
+def outlook_restrict_format_locale(dt: datetime) -> str:
+    """Local time formatted with the Windows user's short date + short time
+    pattern (e.g. '01.11.2026 00:00' on pl-PL).
+
+    Calendar Items.Restrict with IncludeRecurrences=True silently ignores a
+    date it cannot parse in the user's locale (the US 'mm/dd/yyyy hh:mm AM'
+    form is ignored on a Polish system and the whole calendar comes back), so
+    calendar filters must use the locale's own pattern. Falls back to
+    `outlook_restrict_format` off Windows or if the API call fails.
+    """
+    local = to_local(dt)
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class SYSTEMTIME(ctypes.Structure):
+            _fields_ = [
+                (name, wintypes.WORD)
+                for name in (
+                    "wYear", "wMonth", "wDayOfWeek", "wDay",
+                    "wHour", "wMinute", "wSecond", "wMilliseconds",
+                )
+            ]
+
+        st = SYSTEMTIME(
+            local.year, local.month, (local.isoweekday() % 7), local.day,
+            local.hour, local.minute, 0, 0,
+        )
+        k32 = ctypes.windll.kernel32
+        dbuf = ctypes.create_unicode_buffer(128)
+        tbuf = ctypes.create_unicode_buffer(128)
+        DATE_SHORTDATE, TIME_NOSECONDS = 0x1, 0x2
+        if not k32.GetDateFormatEx(None, DATE_SHORTDATE, ctypes.byref(st), None, dbuf, 128, None):
+            raise OSError("GetDateFormatEx failed")
+        if not k32.GetTimeFormatEx(None, TIME_NOSECONDS, ctypes.byref(st), None, tbuf, 128):
+            raise OSError("GetTimeFormatEx failed")
+        return f"{dbuf.value} {tbuf.value}"
+    except Exception:
+        return outlook_restrict_format(dt)
+
+
 def applescript_date_literal(dt: datetime) -> str:
     """Locale-independent AppleScript date literal usable in `whose`-clauses.
 

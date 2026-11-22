@@ -19,12 +19,21 @@ def _summary_to_json(s: EmailSummary) -> dict[str, Any]:
     return raw
 
 
+_FOLDERS_HELP = (
+    " Folder names address the default mailbox ('Inbox', 'Sent Items', or a path from "
+    "outlook_list_folders). Other data files (PST archives, extra mailboxes) are addressed "
+    "as '//<store>/<folder>', e.g. '//archive/Inbox' (store = name or unique fragment, "
+    "see outlook_list_stores); '//*/Inbox' means that folder in every store."
+)
+
+
 def register(mcp: Any, backend: Backend) -> None:
     @mcp.tool(
         name="outlook_get_emails_in_time_range",
         description=(
             "Return emails received or sent within [start_utc, end_utc). Folders default "
-            "to Inbox and Sent Items. This is the primary extraction tool."
+            "to Inbox and Sent Items of the default mailbox. This is the primary extraction tool."
+            + _FOLDERS_HELP
         ),
     )
     async def outlook_get_emails_in_time_range(
@@ -46,7 +55,10 @@ def register(mcp: Any, backend: Backend) -> None:
 
     @mcp.tool(
         name="outlook_search_emails",
-        description="Search emails by subject, sender, or body text.",
+        description=(
+            "Search emails by subject, sender, or body text. Folders default to the default "
+            "mailbox's Inbox." + _FOLDERS_HELP
+        ),
     )
     async def outlook_search_emails(
         query: str,

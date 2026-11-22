@@ -30,7 +30,11 @@ from ..errors import (
     FolderNotFoundError,
 )
 from ..utils.email_extract import detect_importance, domain_of, preview_text
-from ..utils.filter_utils import build_time_range_restrict, escape_dasl
+from ..utils.filter_utils import (
+    build_calendar_overlap_restrict,
+    build_time_range_restrict,
+    escape_dasl,
+)
 from ..utils.folder_utils import canonicalize_folder_name, split_folder_path
 from ..utils.mapi_props import (
     PR_IN_REPLY_TO_ID,
@@ -1924,23 +1928,44 @@ def _sync_list_calendar_events(
     calendar_id: str | None,
     max_results: int,
 ) -> list[CalendarEvent]:
+    # Inputs named *_utc: a naive datetime ('2026-11-01') is taken as UTC.
+    if start_utc.tzinfo is None:
+        start_utc = start_utc.replace(tzinfo=timezone.utc)
+    if end_utc.tzinfo is None:
+        end_utc = end_utc.replace(tzinfo=timezone.utc)
     calendar = _resolve_calendar(namespace, calendar_id)
+    # Order matters: Sort("[Start]") first, then IncludeRecurrences, then
+    # Restrict, all on the same Items object (each calendar.Items access is a
+    # fresh collection). The filter is an overlap test in the user's locale
+    # date format; a US-format date is silently ignored on non-US locales.
     items = calendar.Items
-    try:
-        items.IncludeRecurrences = True
-        items.Sort("[Start]", False)
-    except Exception:
-        pass
-    restrict = build_time_range_restrict("Start", start_utc, end_utc)
+    items.Sort("[Start]")
+    items.IncludeRecurrences = True
+    restrict = build_calendar_overlap_restrict(start_utc, end_utc)
     try:
         filtered = items.Restrict(restrict)
     except Exception as exc:
-        raise EmailNotFoundError(f"Calendar Restrict failed: {exc}") from exc
+        raise EmailNotFoundError(f"Calendar Restrict failed ({restrict}): {exc}") from exc
+    # With IncludeRecurrences the collection's Count is meaningless and Python
+    # iteration is unreliable: walk it with GetFirst/GetNext. As a guard
+    # against a filter Outlook ignored, re-check the window in Python, stop once
+    # (sorted) starts pass end_utc and cap the number of items scanned.
     results: list[CalendarEvent] = []
-    for item in filtered:
-        if len(results) >= max_results:
+    scanned = 0
+    scan_cap = max(max_results * 20, 2000)
+    item = filtered.GetFirst()
+    while item is not None and len(results) < max_results and scanned < scan_cap:
+        scanned += 1
+        event = _extract_calendar_event(item)
+        if event.start_utc is not None and event.start_utc >= end_utc:
             break
-        results.append(_extract_calendar_event(item))
+        if event.end_utc is not None:
+            overlaps = event.end_utc > start_utc
+        else:
+            overlaps = event.start_utc is None or event.start_utc >= start_utc
+        if overlaps:
+            results.append(event)
+        item = filtered.GetNext()
     return results
 
 

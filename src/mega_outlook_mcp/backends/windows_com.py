@@ -7,6 +7,9 @@ first argument.
 
 from __future__ import annotations
 
+import logging
+import re
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -89,6 +92,39 @@ class WindowsComBackend(Backend):
     ) -> list[EmailSummary]:
         return await self._bridge.execute(
             _sync_get_emails_in_time_range, start_utc, end_utc, folders, max_results
+        )
+
+    # Optional fast paths used by composite tools (feature-detected there, so
+    # other backends need not implement them).
+    async def get_emails_in_time_range_light(
+        self,
+        start_utc: datetime,
+        end_utc: datetime,
+        folders: list[str],
+        max_results: int,
+    ) -> list[EmailSummary]:
+        """Like get_emails_in_time_range, but to_smtp/cc_smtp are empty and
+        has_real_attachments is False until passed through enrich_summaries."""
+        return await self._bridge.execute(
+            _sync_get_emails_in_time_range, start_utc, end_utc, folders, max_results,
+            details=False,
+        )
+
+    async def enrich_summaries(self, summaries: list[EmailSummary]) -> list[EmailSummary]:
+        if not summaries:
+            return []
+        return await self._bridge.execute(_sync_enrich_summaries, list(summaries))
+
+    async def get_plain_bodies(self, entry_ids: list[str]) -> dict[str, str]:
+        if not entry_ids:
+            return {}
+        return await self._bridge.execute(_sync_get_plain_bodies, list(entry_ids))
+
+    async def get_conversation_senders(
+        self, conversation_id: str, anchor_entry_id: str | None = None
+    ) -> list[EmailSummary] | None:
+        return await self._bridge.execute(
+            _sync_conversation_senders, conversation_id, anchor_entry_id
         )
 
     async def get_conversation_thread(
@@ -309,22 +345,136 @@ class WindowsComBackend(Backend):
 # ---------------------------------------------------------------------------
 
 
-def _resolve_folder(namespace: Any, path: str) -> Any:
-    canonical = canonicalize_folder_name(path)
-    parts = split_folder_path(canonical) or [canonical]
+# Well-known folders. Outlook localizes folder names ("Inbox" is
+# "Skrzynka odbiorcza", "Posteingang", "Boîte de réception"...), and IMAP
+# accounts keep some of them on the server under provider-specific names
+# (e.g. "[Gmail]/..."). Nothing here depends on a language: the English
+# words below are only this tool's API vocabulary, and every other name is
+# read from Outlook itself (GetDefaultFolder(...).Name) at runtime.
+_DEFAULT_FOLDER_IDS: dict[str, int] = {
+    "inbox": 6,     # olFolderInbox
+    "sent": 5,      # olFolderSentMail
+    "drafts": 16,   # olFolderDrafts
+    "deleted": 3,   # olFolderDeletedItems
+    "junk": 23,     # olFolderJunk
+    "outbox": 4,    # olFolderOutbox
+}
+_API_FOLDER_ALIASES: dict[str, str] = {
+    "inbox": "inbox",
+    "sent": "sent", "sent items": "sent", "sent mail": "sent",
+    "drafts": "drafts",
+    "deleted": "deleted", "deleted items": "deleted", "trash": "deleted",
+    "junk": "junk", "junk email": "junk", "spam": "junk",
+    "outbox": "outbox",
+}
+_PAREN_SUFFIX_RE = re.compile(r"\s*\([^)]*\)\s*$")
+
+
+def _norm_name(name: str) -> str:
+    """Lower-case, drop a trailing '(This computer only)'-style suffix."""
+    return _PAREN_SUFFIX_RE.sub("", (name or "").strip()).strip().lower()
+
+
+def _walk_path(root: Any, path: str) -> Any | None:
+    folder = root
+    for part in split_folder_path(path) or [path]:
+        try:
+            folder = folder.Folders[part]
+        except Exception:
+            return None
+    return folder
+
+
+def _folder_item_count(folder: Any) -> int:
     try:
-        folder = namespace.GetDefaultFolder(OL_FOLDER_INBOX).Parent
+        return int(folder.Items.Count)
     except Exception:
-        folder = None
-    if folder is not None:
-        for part in parts:
-            try:
-                folder = folder.Folders[part]
-            except Exception:
-                folder = None
-                break
+        return 0
+
+
+def _folder_display_path(folder: Any, fallback: str) -> str:
+    """Path as outlook_list_folders shows it, e.g. '[Gmail]/Wysłane'."""
+    try:
+        raw = folder.FolderPath  # "\\\\store\\[Gmail]\\Wysłane"
+        parts = [p for p in raw.split("\\") if p]
+        if len(parts) >= 2:
+            return "/".join(parts[1:])
+    except Exception:
+        pass
+    return fallback
+
+
+def _localized_default_names(namespace: Any) -> dict[str, str]:
+    """{normalized localized name: kind}, read from this Outlook install."""
+    names: dict[str, str] = {}
+    for kind, folder_id in _DEFAULT_FOLDER_IDS.items():
+        try:
+            names.setdefault(_norm_name(namespace.GetDefaultFolder(folder_id).Name), kind)
+        except Exception:
+            continue
+    return names
+
+
+def _folder_kind(namespace: Any, path: str) -> str | None:
+    """Which well-known folder `path` means, in any UI language."""
+    if not path:
+        return None
+    last = split_folder_path(path.strip())
+    candidates = {_norm_name(path), _norm_name(last[-1]) if last else ""}
+    for name in candidates:
+        if name in _API_FOLDER_ALIASES:
+            return _API_FOLDER_ALIASES[name]
+    localized = _localized_default_names(namespace)
+    for name in candidates:
+        if name in localized:
+            return localized[name]
+    return None
+
+
+def _is_sent_folder(namespace: Any, folder: Any, requested: str, label: str) -> bool:
+    if _folder_kind(namespace, requested) == "sent" or _folder_kind(namespace, label) == "sent":
+        return True
+    try:
+        entry_id = folder.EntryID
+    except Exception:
+        return False
+    try:
+        return namespace.GetDefaultFolder(_DEFAULT_FOLDER_IDS["sent"]).EntryID == entry_id
+    except Exception:
+        return False
+
+
+def _resolve_folder(namespace: Any, path: str) -> Any:
+    try:
+        root = namespace.GetDefaultFolder(OL_FOLDER_INBOX).Parent
+    except Exception:
+        root = None
+
+    # 1. The path exactly as given (real folder names always win).
+    if root is not None and path and path.strip():
+        folder = _walk_path(root, path.strip())
         if folder is not None:
             return folder
+
+    # 2. A well-known folder, named either with this tool's English API word
+    #    ("Inbox", "Sent Items") or with Outlook's own name for it in
+    #    whatever language Outlook runs in: use Outlook's default folder.
+    kind = _folder_kind(namespace, path)
+    if kind is not None:
+        default_folder = None
+        try:
+            default_folder = namespace.GetDefaultFolder(_DEFAULT_FOLDER_IDS[kind])
+        except Exception:
+            default_folder = None
+        _log.info(
+            "resolve %r -> kind=%s default=%r items=%s",
+            path, kind,
+            _folder_display_path(default_folder, "?") if default_folder is not None else None,
+            _folder_item_count(default_folder) if default_folder is not None else None,
+        )
+        if default_folder is not None:
+            return default_folder
+
     raise FolderNotFoundError(
         f"Folder {path!r} not found. Call outlook_list_folders to see available folders."
     )
@@ -351,6 +501,63 @@ def _pywintime_to_utc(value: Any) -> datetime | None:
         return None
 
 
+def _pywintime_local_to_utc(value: Any) -> datetime | None:
+    """Convert an Outlook object-model time (local wall clock) to UTC.
+
+    Properties such as MailItem.ReceivedTime / SentOn are returned by
+    Outlook in local time, and pywin32 attaches a misleading tzinfo to
+    them. Drop it, interpret the wall-clock value in the system time zone
+    (DST-aware) and convert to UTC.
+    """
+    if value is None:
+        return None
+    try:
+        naive = datetime(
+            value.year, value.month, value.day, value.hour, value.minute, value.second
+        )
+    except Exception:
+        return None
+    if naive.year >= 4500:  # Outlook's "no date" sentinel (1/1/4501)
+        return None
+    try:
+        return naive.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _default_account_smtp(namespace: Any) -> str:
+    try:
+        store_id = namespace.GetDefaultFolder(OL_FOLDER_INBOX).Store.StoreID
+    except Exception:
+        store_id = None
+    fallback = ""
+    try:
+        accounts = list(namespace.Accounts)
+    except Exception:
+        accounts = []
+    for account in accounts:
+        try:
+            smtp = account.SmtpAddress or ""
+        except Exception:
+            continue
+        if "@" not in smtp:
+            continue
+        if store_id is not None:
+            try:
+                if account.DeliveryStore.StoreID == store_id:
+                    return smtp
+            except Exception:
+                pass
+        fallback = fallback or smtp
+    if fallback:
+        return fallback
+    try:
+        addr = namespace.CurrentUser.Address or ""
+        return addr if "@" in addr and "/" not in addr else ""
+    except Exception:
+        return ""
+
+
 def _sync_get_mailbox_info(namespace: Any) -> MailboxInfo:
     user = namespace.CurrentUser
     smtp = ""
@@ -364,6 +571,11 @@ def _sync_get_mailbox_info(namespace: Any) -> MailboxInfo:
             smtp = exchange_user.PrimarySmtpAddress if exchange_user else ""
         except Exception:
             smtp = ""
+    if not smtp:
+        # Non-Exchange profiles (IMAP/POP): CurrentUser has no Exchange user;
+        # use the SMTP address of the account that delivers to the default
+        # Inbox's store, else the first account with one.
+        smtp = _default_account_smtp(namespace)
     display = ""
     try:
         display = user.Name or ""
@@ -427,17 +639,22 @@ def _extract_summary(item: Any, folder_path: str) -> EmailSummary:
     except Exception:
         pass
     try:
-        received = _pywintime_to_utc(item.ReceivedTime)
+        received = _pywintime_local_to_utc(item.ReceivedTime)
     except Exception:
         received = None
     try:
-        sent = _pywintime_to_utc(item.SentOn)
+        sent = _pywintime_local_to_utc(item.SentOn)
     except Exception:
         sent = None
     try:
         conv_id = item.ConversationID or ""
     except Exception:
         conv_id = ""
+    if conv_id:
+        try:
+            _remember_conversation(conv_id, item.EntryID)
+        except Exception:
+            pass
     try:
         has_real = any(
             int(getattr(a, "Type", 0)) in ATTACH_TYPES_REAL for a in item.Attachments
@@ -472,32 +689,508 @@ def _sync_get_emails_in_time_range(
     end_utc: datetime,
     folders: list[str],
     max_results: int,
+    details: bool = True,
 ) -> list[EmailSummary]:
     results: list[EmailSummary] = []
     for folder_name in folders:
         folder = _resolve_folder(namespace, folder_name)
-        field = "SentOn" if "sent" in folder_name.lower() else "ReceivedTime"
+        folder_label = _folder_display_path(folder, folder_name)
+        field = "SentOn" if _is_sent_folder(namespace, folder, folder_name, folder_label) else "ReceivedTime"
         restrict = build_time_range_restrict(field, start_utc, end_utc)
-        items = folder.Items
         try:
-            items.Sort(f"[{field}]", True)
-        except Exception:
-            pass
-        try:
-            filtered = items.Restrict(restrict)
+            results.extend(
+                _table_summaries(
+                    namespace, folder, restrict, field, max_results - len(results), folder_label,
+                    details,
+                )
+            )
         except Exception as exc:
             raise EmailNotFoundError(
                 f"Restrict failed on {folder_name!r}: {exc}"
             ) from exc
-        for item in filtered:
-            if len(results) >= max_results:
-                break
-            if getattr(item, "Class", 43) != 43:  # olMail
-                continue
-            results.append(_extract_summary(item, folder_name))
         if len(results) >= max_results:
             break
     return results
+
+
+# --- Table-based listing ------------------------------------------------------
+#
+# Opening a MailItem and reading its properties costs tens of milliseconds per
+# message over COM; folder.GetTable() returns the same scalar properties in
+# bulk (~0.4 ms/row). Rows are read from the table and an item is opened only
+# for what a table cannot provide (recipient SMTP addresses, Exchange sender
+# resolution, inline-vs-real attachment check when the message has any).
+
+_PT = "http://schemas.microsoft.com/mapi/proptag/"
+_COL_CONVERSATION_ID = _PT + "0x30130102"     # PR_CONVERSATION_ID (binary)
+_COL_HAS_ATTACH = _PT + "0x0E1B000B"          # PR_HASATTACH
+_COL_DELIVERY_TIME = _PT + "0x0E060040"       # PR_MESSAGE_DELIVERY_TIME (UTC)
+_COL_SUBMIT_TIME = _PT + "0x00390040"         # PR_CLIENT_SUBMIT_TIME (UTC)
+_COL_PREVIEW = "urn:schemas:httpmail:textdescription"
+_SUMMARY_COLUMNS = [
+    "EntryID",
+    "Subject",
+    "SenderName",
+    "SenderEmailAddress",
+    "UnRead",
+    "Importance",
+    "MessageClass",
+    _COL_CONVERSATION_ID,
+    _COL_HAS_ATTACH,
+    _COL_DELIVERY_TIME,
+    _COL_SUBMIT_TIME,
+    _COL_PREVIEW,
+]
+
+# conversation_id -> entry_id of one message in it, filled as a side effect
+# of every listing so get_conversation_thread can usually skip any search.
+_CONVERSATION_ANCHORS: dict[str, str] = {}
+_CONVERSATION_ANCHORS_MAX = 50_000
+
+
+def _remember_conversation(conversation_id: str, entry_id: str) -> None:
+    if not conversation_id or not entry_id:
+        return
+    if len(_CONVERSATION_ANCHORS) >= _CONVERSATION_ANCHORS_MAX:
+        _CONVERSATION_ANCHORS.clear()
+    _CONVERSATION_ANCHORS[_hex_id(conversation_id)] = entry_id
+
+
+def _is_mail_class(message_class: Any) -> bool:
+    # MailItem (olMail, Class 43) == IPM.Note and its sub-classes.
+    return str(message_class or "").upper().startswith("IPM.NOTE")
+
+
+def _iter_table_rows(table: Any, width: int):
+    while not table.EndOfTable:
+        try:
+            block = table.GetArray(500)
+        except Exception:
+            block = None
+        if block is None:
+            row = table.GetNextRow()
+            if row is None:
+                return
+            yield tuple(row.GetValues())
+            continue
+        if not block:
+            return
+        rows = list(block)
+        if rows and len(rows) == width and len(rows[0]) != width:
+            rows = list(zip(*rows))
+        for row in rows:
+            yield tuple(row)
+
+
+def _item_details(item: Any, has_attach: Any) -> tuple[list[str], list[str], bool]:
+    """(to, cc, has_real_attachments) — the parts a table row cannot give."""
+    to_list: list[str] = []
+    cc_list: list[str] = []
+    has_real = False
+    try:
+        for recip in item.Recipients:
+            smtp = resolve_recipient(recip)
+            if not smtp:
+                continue
+            if getattr(recip, "Type", 1) == 2:
+                cc_list.append(smtp)
+            else:
+                to_list.append(smtp)
+    except Exception:
+        pass
+    if has_attach:
+        try:
+            has_real = any(
+                int(getattr(a, "Type", 0)) in ATTACH_TYPES_REAL for a in item.Attachments
+            )
+        except Exception:
+            has_real = False
+    return to_list, cc_list, has_real
+
+
+# entry_id -> PR_HASATTACH for summaries produced without details, so that
+# enrich_summaries() can skip the attachment check exactly as a full read would.
+_PENDING_HAS_ATTACH: dict[str, bool] = {}
+_PENDING_HAS_ATTACH_MAX = 50_000
+
+
+def _summary_from_row(
+    namespace: Any, row: tuple, folder_path: str, details: bool = True
+) -> EmailSummary:
+    """Build a summary from a table row.
+
+    details=False skips opening the item (recipients and the inline-vs-real
+    attachment check are left empty); enrich_summaries() fills them later
+    for just the summaries a caller actually returns.
+    """
+    (
+        entry_id, subject, sender_name, sender_addr, unread, importance,
+        _message_class, conversation, has_attach, delivered, submitted, preview,
+    ) = row
+    conv_id = _hex_id(conversation)
+    if conv_id:
+        _remember_conversation(conv_id, entry_id)
+
+    sender_smtp = sender_addr if _looks_like_smtp(sender_addr) else ""
+    item = None
+    if details or not sender_smtp:
+        try:
+            item = namespace.GetItemFromID(entry_id)
+        except Exception:
+            item = None
+    if not sender_smtp and item is not None:
+        sender_smtp = resolve_sender(item)
+
+    to_list: list[str] = []
+    cc_list: list[str] = []
+    has_real = False
+    if details:
+        if item is not None:
+            to_list, cc_list, has_real = _item_details(item, has_attach)
+    else:
+        if len(_PENDING_HAS_ATTACH) >= _PENDING_HAS_ATTACH_MAX:
+            _PENDING_HAS_ATTACH.clear()
+        _PENDING_HAS_ATTACH[entry_id] = bool(has_attach)
+
+    return EmailSummary(
+        entry_id=entry_id,
+        conversation_id=conv_id,
+        subject=subject or "",
+        sender_name=sender_name or "",
+        sender_smtp=sender_smtp,
+        to_smtp=to_list,
+        cc_smtp=cc_list,
+        received_utc=_pywintime_to_utc(delivered),
+        sent_utc=_pywintime_to_utc(submitted),
+        is_read=not bool(unread),
+        importance=detect_importance(importance if importance is not None else 1),
+        has_real_attachments=has_real,
+        folder_path=folder_path,
+        preview=preview_text(preview if isinstance(preview, str) else ""),
+    )
+
+
+def _looks_like_smtp(value: Any) -> bool:
+    return isinstance(value, str) and "@" in value and "/" not in value
+
+
+def _table_summaries(
+    namespace: Any,
+    folder: Any,
+    table_filter: str,
+    sort_field: str | None,
+    max_count: int,
+    folder_label: str,
+    details: bool = True,
+) -> list[EmailSummary]:
+    if max_count <= 0:
+        return []
+    table = folder.GetTable(table_filter or "", _OL_USER_ITEMS)
+    if sort_field:
+        try:
+            table.Sort(f"[{sort_field}]", True)
+        except Exception:
+            pass
+    table.Columns.RemoveAll()
+    for column in _SUMMARY_COLUMNS:
+        table.Columns.Add(column)
+    out: list[EmailSummary] = []
+    for row in _iter_table_rows(table, len(_SUMMARY_COLUMNS)):
+        if len(out) >= max_count:
+            break
+        if not row or not row[0] or not _is_mail_class(row[6]):
+            continue
+        out.append(_summary_from_row(namespace, row, folder_label, details))
+    return out
+
+
+def _sync_enrich_summaries(namespace: Any, summaries: list[EmailSummary]) -> list[EmailSummary]:
+    """Fill recipients / has_real_attachments for summaries built with details=False."""
+    from dataclasses import replace
+
+    out: list[EmailSummary] = []
+    for s in summaries:
+        try:
+            item = namespace.GetItemFromID(s.entry_id)
+        except Exception:
+            out.append(s)
+            continue
+        has_attach = _PENDING_HAS_ATTACH.get(s.entry_id, True)
+        to_list, cc_list, has_real = _item_details(item, has_attach)
+        out.append(replace(s, to_smtp=to_list, cc_smtp=cc_list, has_real_attachments=has_real))
+    return out
+
+
+def _sync_get_plain_bodies(namespace: Any, entry_ids: list[str]) -> dict[str, str]:
+    """Full plain-text body per entry_id (table columns truncate at 255 chars)."""
+    out: dict[str, str] = {}
+    for entry_id in entry_ids:
+        try:
+            out[entry_id] = namespace.GetItemFromID(entry_id).Body or ""
+        except Exception:
+            continue
+    return out
+
+
+def _sync_conversation_senders(
+    namespace: Any, conversation_id: str, anchor_entry_id: str | None
+) -> list[EmailSummary] | None:
+    """Sender + times of every message in a conversation, from the
+    conversation table only (no item opened unless a sender is not SMTP).
+
+    Returns None when the conversation cannot be located this way, so the
+    caller can fall back to get_conversation_thread.
+    """
+    target = _hex_id(conversation_id)
+    anchor = anchor_entry_id or _CONVERSATION_ANCHORS.get(target) or _find_conversation_anchor(
+        namespace, target, "", time.monotonic() + _THREAD_SCAN_BUDGET_S
+    )
+    if not anchor:
+        return None
+    try:
+        item = namespace.GetItemFromID(anchor)
+        if _hex_id(getattr(item, "ConversationID", "")) != target:
+            return None
+        conversation = item.GetConversation()
+    except Exception:
+        return None
+    if conversation is None:
+        return None
+    columns = ["EntryID", "SenderEmailAddress", "MessageClass", _COL_DELIVERY_TIME, _COL_SUBMIT_TIME]
+    table = conversation.GetTable()
+    table.Columns.RemoveAll()
+    for column in columns:
+        table.Columns.Add(column)
+    out: list[EmailSummary] = []
+    seen: set[str] = set()
+    for entry_id, sender_addr, message_class, delivered, submitted in _iter_table_rows(table, len(columns)):
+        if not entry_id or entry_id in seen or not _is_mail_class(message_class):
+            continue
+        seen.add(entry_id)
+        sender_smtp = sender_addr if _looks_like_smtp(sender_addr) else ""
+        if not sender_smtp:
+            try:
+                sender_smtp = resolve_sender(namespace.GetItemFromID(entry_id))
+            except Exception:
+                sender_smtp = ""
+        out.append(
+            EmailSummary(
+                entry_id=entry_id,
+                conversation_id=target,
+                subject="",
+                sender_name="",
+                sender_smtp=sender_smtp,
+                to_smtp=[],
+                cc_smtp=[],
+                received_utc=_pywintime_to_utc(delivered),
+                sent_utc=_pywintime_to_utc(submitted),
+                is_read=True,
+                importance="normal",
+                has_real_attachments=False,
+                folder_path="",
+                preview="",
+            )
+        )
+    return out
+
+
+# --- Conversation lookup ---------------------------------------------------
+#
+# The previous implementation opened every message in every top-level folder
+# and compared item.ConversationID one COM call at a time. On a large IMAP
+# store (tens of thousands of items, plus Outlook's sync-log folders) that
+# takes many minutes, and because the COM bridge runs jobs one at a time on a
+# single thread, every later tool call queued behind it and timed out too.
+#
+# This version reads lightweight MAPI tables (folder.GetTable) instead of
+# opening items, skips Outlook's own sync-log folders, walks subfolders (so
+# e.g. "[Gmail]/Wysłane" is included), narrows by topic when one is given and
+# stops after a fixed time budget so it can never block the bridge for long.
+
+_log = logging.getLogger(__name__)
+
+_OL_MAIL_ITEM = 0  # OlItemType.olMailItem (Folder.DefaultItemType)
+_OL_USER_ITEMS = 0  # OlTableContents.olUserItems
+_OL_SKIP_DEFAULT_FOLDERS = (
+    19,  # olFolderConflicts
+    20,  # olFolderSyncIssues
+    21,  # olFolderLocalFailures
+    22,  # olFolderServerFailures
+)
+_PR_CONVERSATION_ID = "http://schemas.microsoft.com/mapi/proptag/0x30130102"
+_PR_CONVERSATION_TOPIC = "http://schemas.microsoft.com/mapi/proptag/0x0070001F"
+_THREAD_SCAN_BUDGET_S = 45.0
+_TABLE_BATCH = 500
+_TOPIC_PREFIX_RE = re.compile(r"^\s*(re|fw|fwd|odp|pd|aw|wg)\s*:\s*", re.IGNORECASE)
+
+
+def _hex_id(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value).hex().upper()
+    return str(value).replace("-", "").replace(" ", "").strip().upper()
+
+
+def _strip_topic_prefixes(topic: str) -> str:
+    previous = None
+    while previous != topic:
+        previous = topic
+        topic = _TOPIC_PREFIX_RE.sub("", topic)
+    return topic.strip()
+
+
+def _skipped_folder_ids(namespace: Any) -> set[str]:
+    ids: set[str] = set()
+    for folder_type in _OL_SKIP_DEFAULT_FOLDERS:
+        try:
+            ids.add(namespace.GetDefaultFolder(folder_type).EntryID)
+        except Exception:
+            continue
+    return ids
+
+
+def _iter_mail_folders(parent: Any, skip_ids: set[str], parent_path: str | None = None):
+    try:
+        children = list(parent.Folders)
+    except Exception:
+        return
+    for folder in children:
+        try:
+            name = folder.Name
+        except Exception:
+            continue
+        full_path = name if parent_path is None else f"{parent_path}/{name}"
+        try:
+            if folder.EntryID in skip_ids:
+                continue
+        except Exception:
+            pass
+        try:
+            item_type = int(folder.DefaultItemType)
+        except Exception:
+            item_type = _OL_MAIL_ITEM
+        if item_type == _OL_MAIL_ITEM:
+            yield folder, full_path
+        yield from _iter_mail_folders(folder, skip_ids, full_path)
+
+
+def _table_rows(folder: Any, table_filter: str, columns: list[str], deadline: float):
+    """Yield rows (tuples in `columns` order) of a folder's MAPI table."""
+    table = folder.GetTable(table_filter, _OL_USER_ITEMS)
+    table.Columns.RemoveAll()
+    for column in columns:
+        table.Columns.Add(column)
+    width = len(columns)
+    while not table.EndOfTable:
+        if time.monotonic() > deadline:
+            return
+        try:
+            block = table.GetArray(_TABLE_BATCH)
+        except Exception:
+            block = None
+        if block is None:
+            # Fallback: row-by-row reads (slower, but still no item opens).
+            row = table.GetNextRow()
+            if row is None:
+                return
+            values = []
+            for idx in range(1, width + 1):
+                try:
+                    values.append(row.Item(idx))
+                except Exception:
+                    values.append(None)
+            yield tuple(values)
+            continue
+        if not block:
+            return
+        rows = list(block)
+        # pywin32 should hand back one tuple per row; transpose if it gave
+        # one tuple per column instead.
+        if rows and len(rows) == width and len(rows[0]) != width:
+            rows = list(zip(*rows))
+        for row in rows:
+            yield tuple(row)
+
+
+_ANCHOR_SEARCH_BUDGET_S = 20.0
+
+
+def _find_conversation_anchor(
+    namespace: Any, target: str, topic: str, deadline: float
+) -> str | None:
+    """EntryID of one message in conversation `target`, from Inbox/Sent tables."""
+    budget_end = min(deadline, time.monotonic() + _ANCHOR_SEARCH_BUDGET_S)
+    table_filter = ""
+    if topic:
+        table_filter = (
+            f'@SQL="{_PR_CONVERSATION_TOPIC}" = \'{topic.replace(chr(39), chr(39) * 2)}\''
+        )
+    for folder_id, sort_field in (
+        (OL_FOLDER_INBOX, "ReceivedTime"),
+        (_DEFAULT_FOLDER_IDS["sent"], "SentOn"),
+    ):
+        try:
+            folder = namespace.GetDefaultFolder(folder_id)
+            try:
+                table = folder.GetTable(table_filter, _OL_USER_ITEMS)
+            except Exception:
+                table = folder.GetTable("", _OL_USER_ITEMS)
+            try:
+                table.Sort(f"[{sort_field}]", True)
+            except Exception:
+                pass
+            table.Columns.RemoveAll()
+            table.Columns.Add("EntryID")
+            table.Columns.Add(_PR_CONVERSATION_ID)
+            for row in _iter_table_rows(table, 2):
+                if time.monotonic() > budget_end:
+                    return None
+                if len(row) > 1 and row[0] and _hex_id(row[1]) == target:
+                    _remember_conversation(target, row[0])
+                    return row[0]
+        except Exception as exc:  # noqa: BLE001
+            _log.info("anchor search skipped folder %s: %s", folder_id, exc)
+    return None
+
+
+def _thread_via_conversation(
+    namespace: Any, anchor_entry_id: str, target: str, max_messages: int
+) -> list[EmailSummary]:
+    item = namespace.GetItemFromID(anchor_entry_id)
+    if _hex_id(getattr(item, "ConversationID", "")) != target:
+        return []
+    conversation = item.GetConversation()
+    if conversation is None:
+        return []
+    table = conversation.GetTable()
+    table.Columns.RemoveAll()
+    table.Columns.Add("EntryID")
+    collected: list[EmailSummary] = []
+    seen: set[str] = set()
+    for row in _iter_table_rows(table, 1):
+        if len(collected) >= max_messages:
+            break
+        entry_id = row[0] if row else None
+        if not entry_id or entry_id in seen:
+            continue
+        seen.add(entry_id)
+        try:
+            message = namespace.GetItemFromID(entry_id)
+        except Exception:
+            continue
+        if getattr(message, "Class", 43) != 43:
+            continue
+        try:
+            parent = message.Parent
+            label = _folder_display_path(parent, getattr(parent, "Name", ""))
+        except Exception:
+            label = ""
+        collected.append(_extract_summary(message, label))
+    collected.sort(
+        key=lambda s: s.sent_utc or s.received_utc or datetime.min.replace(tzinfo=timezone.utc)
+    )
+    return collected
 
 
 def _sync_get_conversation_thread(
@@ -506,39 +1199,122 @@ def _sync_get_conversation_thread(
     conversation_topic: str | None,
     max_messages: int,
 ) -> list[EmailSummary]:
-    collected: list[EmailSummary] = []
+    target = _hex_id(conversation_id)
+    deadline = time.monotonic() + _THREAD_SCAN_BUDGET_S
+    topic = _strip_topic_prefixes(conversation_topic) if conversation_topic else ""
+
+    # Fast path: find one message of the conversation, then let Outlook's
+    # own conversation index (MailItem.GetConversation) return the rest,
+    # across every folder of the store.
+    anchor = _CONVERSATION_ANCHORS.get(target) or _find_conversation_anchor(
+        namespace, target, topic, deadline
+    )
+    if anchor:
+        try:
+            thread = _thread_via_conversation(namespace, anchor, target, max_messages)
+        except Exception as exc:  # noqa: BLE001
+            _log.info("GetConversation path failed for %s: %s", conversation_id, exc)
+            thread = None
+        if thread:
+            return thread
+
+    table_filter = ""
+    if topic:
+        table_filter = (
+            f'@SQL="{_PR_CONVERSATION_TOPIC}" = \'{topic.replace(chr(39), chr(39) * 2)}\''
+        )
+
+    columns = ["EntryID", _PR_CONVERSATION_ID]
     root = namespace.GetDefaultFolder(OL_FOLDER_INBOX).Parent
-    for folder in root.Folders:
+    skip_ids = _skipped_folder_ids(namespace)
+
+    collected: list[EmailSummary] = []
+    seen: set[str] = set()
+    rows_without_id = 0
+    timed_out = False
+
+    for folder, folder_path in _iter_mail_folders(root, skip_ids):
         if len(collected) >= max_messages:
             break
+        if time.monotonic() > deadline:
+            timed_out = True
+            break
         try:
-            items = folder.Items
-            if conversation_topic:
-                try:
-                    items = items.Restrict(
-                        f"[ConversationTopic] = '{escape_dasl(conversation_topic)}'"
-                    )
-                except Exception:
-                    pass
-            for item in items:
+            try:
+                rows = _table_rows(folder, table_filter, columns, deadline)
+                row_iter = iter(rows)
+                first = next(row_iter, None)
+            except Exception:
+                if not table_filter:
+                    raise
+                # Filter rejected by this store: scan the folder unfiltered.
+                rows = _table_rows(folder, "", columns, deadline)
+                row_iter = iter(rows)
+                first = next(row_iter, None)
+            pending = [] if first is None else [first]
+            for row in _chain(pending, row_iter):
                 if len(collected) >= max_messages:
                     break
-                if getattr(item, "Class", 43) != 43:
+                entry_id = row[0] if row else None
+                if not entry_id or entry_id in seen:
                     continue
-                try:
-                    if item.ConversationID != conversation_id:
+                row_cid = _hex_id(row[1] if len(row) > 1 else None)
+                if row_cid:
+                    if row_cid != target:
                         continue
+                else:
+                    rows_without_id += 1
+                    # Store does not expose the ID in tables. Only open the
+                    # item when a topic filter keeps the candidate set small.
+                    if not topic:
+                        continue
+                try:
+                    item = namespace.GetItemFromID(entry_id)
                 except Exception:
                     continue
-                collected.append(_extract_summary(item, folder.Name))
-        except Exception:
+                if getattr(item, "Class", 43) != 43:
+                    continue
+                if not row_cid:
+                    try:
+                        if _hex_id(item.ConversationID) != target:
+                            continue
+                    except Exception:
+                        continue
+                seen.add(entry_id)
+                collected.append(_extract_summary(item, folder_path))
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("conversation scan skipped folder %r: %s", folder_path, exc)
             continue
+    if time.monotonic() > deadline:
+        timed_out = True
+
     if not collected:
+        hints = []
+        if timed_out:
+            hints.append(
+                f"the scan stopped after {_THREAD_SCAN_BUDGET_S:.0f}s"
+            )
+        if rows_without_id and not topic:
+            hints.append("this store does not expose conversation IDs in tables")
+        hint = ""
+        if hints:
+            hint = " (" + "; ".join(hints) + "). Pass conversation_topic to narrow the search."
         raise ConversationNotFoundError(
-            f"No messages found for conversation_id {conversation_id!r}."
+            f"No messages found for conversation_id {conversation_id!r}{hint}"
+        )
+    if timed_out:
+        _log.warning(
+            "conversation %s: scan budget reached, returning %d message(s) found so far",
+            conversation_id,
+            len(collected),
         )
     collected.sort(key=lambda s: s.sent_utc or s.received_utc or datetime.min.replace(tzinfo=timezone.utc))
     return collected
+
+
+def _chain(head: list[Any], tail: Any):
+    yield from head
+    yield from tail
 
 
 def _sync_get_email_full_metadata(namespace: Any, entry_id: str) -> EmailFullMetadata:
@@ -636,31 +1412,52 @@ def _sync_search_emails(
     max_results: int,
 ) -> list[EmailSummary]:
     q = escape_dasl(query)
-    if field == "subject":
-        restrict = f"@SQL=\"urn:schemas:httpmail:subject\" LIKE '%{q}%'"
-    elif field == "sender":
-        restrict = f"@SQL=\"urn:schemas:httpmail:fromemail\" LIKE '%{q}%'"
-    elif field == "body":
-        restrict = f"@SQL=\"urn:schemas:httpmail:textdescription\" LIKE '%{q}%'"
-    else:
-        restrict = (
-            f"@SQL=(\"urn:schemas:httpmail:subject\" LIKE '%{q}%' "
-            f"OR \"urn:schemas:httpmail:fromemail\" LIKE '%{q}%' "
-            f"OR \"urn:schemas:httpmail:textdescription\" LIKE '%{q}%')"
-        )
+    subject = f"\"urn:schemas:httpmail:subject\" LIKE '%{q}%'"
+    sender = (
+        f"(\"urn:schemas:httpmail:fromemail\" LIKE '%{q}%' "
+        f"OR \"urn:schemas:httpmail:fromname\" LIKE '%{q}%')"
+    )
+    body_like = f"\"urn:schemas:httpmail:textdescription\" LIKE '%{q}%'"
+    # A substring LIKE over message bodies is evaluated item by item and
+    # takes minutes on large stores; when the store is indexed by Windows
+    # Search, ci_phrasematch answers the same question from the index.
+    body_indexed = f"\"urn:schemas:httpmail:textdescription\" ci_phrasematch '{q}'"
+
+    def build(use_index: bool) -> str:
+        body = body_indexed if use_index else body_like
+        if field == "subject":
+            return f"@SQL={subject}"
+        if field == "sender":
+            return f"@SQL={sender}"
+        if field == "body":
+            return f"@SQL={body}"
+        return f"@SQL=({subject} OR {sender} OR {body})"
+
     results: list[EmailSummary] = []
     for folder_name in folders:
         folder = _resolve_folder(namespace, folder_name)
+        folder_label = _folder_display_path(folder, folder_name)
+        use_index = False
+        if field not in ("subject", "sender"):
+            try:
+                use_index = bool(folder.Store.IsInstantSearchEnabled)
+            except Exception:
+                use_index = False
+        remaining = max_results - len(results)
         try:
-            filtered = folder.Items.Restrict(restrict)
+            found = _table_summaries(
+                namespace, folder, build(use_index), "ReceivedTime", remaining, folder_label
+            )
         except Exception:
-            continue
-        for item in filtered:
-            if len(results) >= max_results:
-                break
-            if getattr(item, "Class", 43) != 43:
+            if not use_index:
                 continue
-            results.append(_extract_summary(item, folder_name))
+            try:
+                found = _table_summaries(
+                    namespace, folder, build(False), "ReceivedTime", remaining, folder_label
+                )
+            except Exception:
+                continue
+        results.extend(found)
         if len(results) >= max_results:
             break
     return results
@@ -689,14 +1486,14 @@ def _extract_calendar_event(item: Any) -> CalendarEvent:
         start = _pywintime_to_utc(item.StartUTC)
     except Exception:
         try:
-            start = _pywintime_to_utc(item.Start)
+            start = _pywintime_local_to_utc(item.Start)
         except Exception:
             start = None
     try:
         end = _pywintime_to_utc(item.EndUTC)
     except Exception:
         try:
-            end = _pywintime_to_utc(item.End)
+            end = _pywintime_local_to_utc(item.End)
         except Exception:
             end = None
     return CalendarEvent(
@@ -1309,7 +2106,7 @@ def _extract_note(item: Any) -> NoteInfo:
         note_id=item.EntryID,
         subject=getattr(item, "Subject", "") or "",
         body_plain=getattr(item, "Body", "") or "",
-        last_modified_utc=_pywintime_to_utc(getattr(item, "LastModificationTime", None)),
+        last_modified_utc=_pywintime_local_to_utc(getattr(item, "LastModificationTime", None)),
     )
 
 

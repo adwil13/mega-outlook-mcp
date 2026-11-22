@@ -171,11 +171,11 @@ def register(mcp: Any, backend: Backend) -> None:
             return await backend.get_emails_in_time_range(start, end, folders, max_results)
         return await fn(start, end, folders, max_results)
 
-    async def enrich(summaries: list[EmailSummary]) -> list[EmailSummary]:
+    async def enrich(summaries: list[EmailSummary], attachments: bool = True) -> list[EmailSummary]:
         fn = getattr(backend, "enrich_summaries", None)
         if fn is None or not summaries:
             return summaries
-        return await fn(summaries)
+        return await fn(summaries, attachments=attachments)
 
     async def thread_senders(cid: str, anchor_entry_id: str | None) -> list[EmailSummary]:
         fn = getattr(backend, "get_conversation_senders", None)
@@ -363,7 +363,7 @@ def register(mcp: Any, backend: Backend) -> None:
                 continue
             stalled_sent.append(s)
         stalled: list[dict[str, Any]] = []
-        for s in await enrich(stalled_sent):
+        for s in await enrich(stalled_sent, attachments=False):  # output lists recipients only
             sent_at = _utc(_ts(s))
             stalled.append(
                 {
@@ -527,7 +527,7 @@ def register(mcp: Any, backend: Backend) -> None:
         )
         # Recipients matter only for outbound mail; inbound needs the sender.
         outbound = [e for e in emails if (e.sender_smtp or "").lower() == owner_smtp and owner_smtp]
-        enriched = {e.entry_id: e for e in await enrich(outbound)}
+        enriched = {e.entry_id: e for e in await enrich(outbound, attachments=False)}
         emails = [enriched.get(e.entry_id, e) for e in emails]
         stats: dict[str, dict[str, Any]] = defaultdict(
             lambda: {"sent_to": 0, "received_from": 0, "last_contact_utc": None}

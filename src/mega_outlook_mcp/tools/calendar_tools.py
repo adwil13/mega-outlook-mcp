@@ -19,15 +19,35 @@ def _event_to_json(e: CalendarEvent) -> dict[str, Any]:
     return raw
 
 
+LIST_BODY_MAX_CHARS = 300
+
+
+def _trim_body(raw: dict[str, Any], max_chars: int) -> dict[str, Any]:
+    body = raw.get("body_plain") or ""
+    if max_chars <= 0:
+        raw["body_plain"] = ""
+        raw["body_truncated"] = bool(body)
+    elif len(body) > max_chars:
+        raw["body_plain"] = body[:max_chars].rstrip() + "…"
+        raw["body_truncated"] = True
+    else:
+        raw["body_truncated"] = False
+    return raw
+
+
 def register(mcp: Any, backend: Backend) -> None:
     @mcp.tool(
         name="outlook_list_calendar_events",
         description=(
-            "List calendar events whose start falls within [start_utc, end_utc). calendar_id "
-            "defaults to the default mailbox's calendar; it also accepts a folder EntryID, a "
-            "folder path in the same syntax as mail folders (e.g. '//archive/Kalendarz'), or "
-            "just a data file ('//archive/') for that file's default calendar. See "
-            "outlook_list_stores for each data file's calendar_path."
+            "List calendar events overlapping [start_utc, end_utc), sorted by start, with "
+            "recurring series expanded into individual occurrences. Dates are ISO 8601; "
+            "without an offset they are taken as UTC. calendar_id defaults to the default "
+            "mailbox's calendar; it also accepts a folder EntryID, a folder path in the same "
+            "syntax as mail folders (e.g. '//archive/Kalendarz'), or just a data file "
+            "('//archive/') for that file's default calendar. See outlook_list_stores for each "
+            "data file's calendar_path. body_plain is cut to body_max_chars (default 300, "
+            "0 = omit; body_truncated tells if it was cut); use outlook_get_calendar_event "
+            "for the full body."
         ),
     )
     async def outlook_list_calendar_events(
@@ -35,6 +55,7 @@ def register(mcp: Any, backend: Backend) -> None:
         end_utc: str,
         calendar_id: str | None = None,
         max_results: int = 200,
+        body_max_chars: int = LIST_BODY_MAX_CHARS,
     ) -> dict[str, Any]:
         params = ListCalendarEventsInput(
             start_utc=datetime.fromisoformat(start_utc),
@@ -45,7 +66,7 @@ def register(mcp: Any, backend: Backend) -> None:
         events = await backend.list_calendar_events(
             params.start_utc, params.end_utc, params.calendar_id, params.max_results
         )
-        return {"events": [_event_to_json(e) for e in events]}
+        return {"events": [_trim_body(_event_to_json(e), body_max_chars) for e in events]}
 
     @mcp.tool(
         name="outlook_get_calendar_event",

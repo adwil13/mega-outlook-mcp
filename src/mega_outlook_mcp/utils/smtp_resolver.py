@@ -44,6 +44,15 @@ def resolve_address_entry(entry: Any) -> str:
 
 def resolve_recipient(recipient: Any) -> str:
     """Resolve an Outlook Recipient to SMTP."""
+    # Fast path: SMTP/IMAP recipients already carry the SMTP address, which
+    # is one cheap COM call. Exchange recipients carry an X.500 DN here and
+    # fall through to the AddressEntry chain below.
+    try:
+        addr = recipient.Address
+        if _looks_like_smtp(addr):
+            return addr
+    except Exception:
+        pass
     try:
         entry = recipient.AddressEntry
     except Exception:
@@ -60,6 +69,13 @@ def resolve_recipient(recipient: Any) -> str:
 
 def resolve_sender(mail_item: Any) -> str:
     """Resolve the sender of a MailItem to SMTP."""
+    # Fast path (see resolve_recipient): non-Exchange senders.
+    try:
+        addr = mail_item.SenderEmailAddress
+        if _looks_like_smtp(addr):
+            return addr
+    except Exception:
+        pass
     try:
         entry = mail_item.Sender
     except Exception:

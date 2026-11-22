@@ -44,7 +44,7 @@ from ..utils.mapi_props import (
     PR_TRANSPORT_HEADERS,
     safe_get,
 )
-from ..utils.smtp_resolver import resolve_recipient, resolve_sender
+from ..utils.smtp_resolver import resolve_address_entry, resolve_recipient, resolve_sender
 from ..utils.subject_utils import normalize_subject
 from .base import (
     AccountInfo,
@@ -1850,6 +1850,43 @@ def _sync_search_emails(
 # ---------------------------------------------------------------------------
 
 
+_PR_SENT_REPRESENTING_EMAIL = "http://schemas.microsoft.com/mapi/proptag/0x0065001F"
+
+
+def _resolve_organizer(item: Any) -> tuple[str, str]:
+    """(SMTP, display name) of an AppointmentItem's organizer.
+
+    AppointmentItem has no Sender/SenderEmailAddress, so the mail-sender
+    resolver always came back empty. GetOrganizer() returns the organizer's
+    AddressEntry; PR_SENT_REPRESENTING_* is the fallback. PR_SENDER_* is not
+    used: for invites relayed by Google Calendar it holds
+    calendar-notification@google.com, not the organizer.
+    """
+    name = ""
+    try:
+        name = item.Organizer or ""
+    except Exception:
+        pass
+    try:
+        entry = item.GetOrganizer()
+    except Exception:
+        entry = None
+    if entry is not None:
+        smtp = resolve_address_entry(entry)
+        if not name:
+            try:
+                name = entry.Name or ""
+            except Exception:
+                pass
+        if smtp:
+            return smtp, name
+    for prop in (PR_SENT_REPRESENTING_SMTP, _PR_SENT_REPRESENTING_EMAIL):
+        value = safe_get(item, prop)
+        if value and "@" in value and "/" not in value:
+            return value, name
+    return "", name
+
+
 def _extract_calendar_event(item: Any) -> CalendarEvent:
     attendees: list[str] = []
     try:
@@ -1859,11 +1896,7 @@ def _extract_calendar_event(item: Any) -> CalendarEvent:
                 attendees.append(smtp)
     except Exception:
         pass
-    organizer = ""
-    try:
-        organizer = resolve_sender(item)
-    except Exception:
-        organizer = ""
+    organizer, organizer_name = _resolve_organizer(item)
     try:
         start = _pywintime_to_utc(item.StartUTC)
     except Exception:
@@ -1889,6 +1922,7 @@ def _extract_calendar_event(item: Any) -> CalendarEvent:
         attendees_smtp=attendees,
         body_plain=getattr(item, "Body", "") or "",
         is_recurring=bool(getattr(item, "IsRecurring", False)),
+        organizer_name=organizer_name,
     )
 
 

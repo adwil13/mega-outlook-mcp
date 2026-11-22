@@ -105,6 +105,7 @@ class CalendarEvent:
     attendees_smtp: list[str] = field(default_factory=list)
     body_plain: str = ""
     is_recurring: bool = False
+    organizer_name: str = ""
 
 
 @dataclass

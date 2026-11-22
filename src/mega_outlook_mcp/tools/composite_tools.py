@@ -15,6 +15,7 @@ from typing import Any
 from ..backends.base import Backend, EmailSummary
 from ..models.inputs import (
     ExtractActionItemsInput,
+    FindAwaitingMyReplyInput,
     FindPromisedActionsInput,
     FindUnansweredInput,
     MeetingPrepInput,
@@ -140,6 +141,65 @@ _PROMISE_PHRASES = (
     "damy znać",
     "skontaktujemy się",
 )
+
+
+# --- outlook_find_awaiting_my_reply filters ---------------------------------
+# Auto-replies, out-of-office notices and bounces (matched anywhere in the
+# subject, case-insensitive).
+_AUTO_SUBJECT_MARKERS = (
+    "automatic reply",
+    "auto reply",
+    "auto-reply",
+    "autoreply",
+    "automatyczna odpowiedź",
+    "odpowiedź automatyczna",
+    "out of office",
+    "poza biurem",
+    "nieobecność",
+    "undeliverable",
+    "undelivered mail",
+    "delivery status notification",
+    "delivery has failed",
+    "mail delivery failed",
+    "returned mail",
+    "nie dostarczono",
+    "niedostarczona",
+    "niedostarczalne",
+    "no reply!",
+    "do not reply",
+    "nie odpowiadaj",
+)
+# Bulk / machine senders (matched in the local part of the address).
+_BULK_SENDER_MARKERS = (
+    "noreply",
+    "no-reply",
+    "no_reply",
+    "donotreply",
+    "do-not-reply",
+    "do_not_reply",
+    "mailer-daemon",
+    "postmaster",
+    "bounce",
+    "notification",
+    "notify",
+    "powiadomien",
+    "newsletter",
+    "marketing",
+    "mailservice",
+    "automat",
+    "alert",
+)
+_ADDRESSED_ORDER = {"to_me": 0, "cc_me": 1, "other": 2}
+
+
+def _is_auto_subject(subject: str) -> bool:
+    s = (subject or "").lower()
+    return any(marker in s for marker in _AUTO_SUBJECT_MARKERS)
+
+
+def _is_bulk_sender(smtp: str) -> bool:
+    local = (smtp or "").lower().split("@", 1)[0]
+    return any(marker in local for marker in _BULK_SENDER_MARKERS)
 
 
 def _summary_to_json(s: EmailSummary) -> dict[str, Any]:
@@ -376,6 +436,174 @@ def register(mcp: Any, backend: Backend) -> None:
             )
         stalled.sort(key=lambda r: r["hours_waiting"], reverse=True)
         return {"stalled_threads": stalled, "count": len(stalled)}
+
+    @mcp.tool(
+        name="outlook_find_awaiting_my_reply",
+        description=(
+            "Composite. Inbound threads waiting on MY reply: the newest message per "
+            "conversation received in the Inbox in [start_utc, end_utc), older than "
+            "min_age_hours, with no later message from me in Sent Items (start_utc to now). "
+            "Skips mail from me, auto-replies/out-of-office/bounces and bulk senders "
+            "(noreply, notifications, newsletters...). Each item is tagged addressed = "
+            "to_me / cc_me / other (include_other=false drops 'other'); sorted to_me, cc_me, "
+            "other, oldest first. Works on the default data file; reads Outlook tables only "
+            "and opens just the remaining messages to read their recipients."
+        ),
+    )
+    async def outlook_find_awaiting_my_reply(
+        start_utc: str,
+        end_utc: str,
+        min_age_hours: int = 24,
+        include_other: bool = True,
+        max_results: int = 2000,
+    ) -> dict[str, Any]:
+        params = FindAwaitingMyReplyInput(
+            start_utc=datetime.fromisoformat(start_utc),
+            end_utc=datetime.fromisoformat(end_utc),
+            min_age_hours=min_age_hours,
+            include_other=include_other,
+            max_results=max_results,
+        )
+        start = _utc(params.start_utc)
+        end = _utc(params.end_utc)
+        now = datetime.now(timezone.utc)
+        epoch = datetime.min.replace(tzinfo=timezone.utc)
+
+        # My addresses: default mailbox + every configured account.
+        mine: set[str] = set()
+        info = await backend.get_mailbox_info()
+        if info.smtp_address:
+            mine.add(info.smtp_address.lower())
+        try:
+            for account in await backend.list_accounts():
+                if account.smtp_address and "@" in account.smtp_address:
+                    mine.add(account.smtp_address.lower())
+        except Exception:
+            pass
+
+        inbound = await list_light(start, end, ["Inbox"], params.max_results)
+        sent = await list_light(start, now, ["Sent Items"], 5000)
+
+        # 1-2. Filter, then keep the newest inbound message per conversation.
+        skipped = Counter()
+        latest: dict[str, EmailSummary] = {}
+        for m in inbound:
+            sender = (m.sender_smtp or "").lower()
+            if sender and sender in mine:
+                skipped["from_me"] += 1
+                continue
+            if _is_auto_subject(m.subject):
+                skipped["auto_reply_or_bounce"] += 1
+                continue
+            if _is_bulk_sender(sender):
+                skipped["bulk_sender"] += 1
+                continue
+            ts = m.received_utc or m.sent_utc
+            if ts is None:
+                continue
+            key = m.conversation_id or "topic:" + normalize_subject(m.subject)
+            cur = latest.get(key)
+            if cur is None or _utc(cur.received_utc or cur.sent_utc or epoch) < _utc(ts):
+                latest[key] = m
+
+        # 3. Answered = a later message of mine in the same conversation.
+        last_sent: dict[str, datetime] = {}
+        sent_by_topic: dict[str, list[EmailSummary]] = defaultdict(list)
+        for s in sent:
+            ts = _ts(s)
+            if ts is None:
+                continue
+            ts = _utc(ts)
+            if s.conversation_id and last_sent.get(s.conversation_id, epoch) < ts:
+                last_sent[s.conversation_id] = ts
+            topic = normalize_subject(s.subject)
+            if topic:
+                sent_by_topic[topic].append(s)
+
+        min_age = timedelta(hours=params.min_age_hours)
+        pending: list[tuple[EmailSummary, datetime]] = []
+        for m in latest.values():
+            received = _utc(m.received_utc or m.sent_utc)
+            if m.conversation_id and last_sent.get(m.conversation_id, epoch) > received:
+                skipped["answered"] += 1
+                continue
+            # 4. Too recent to count as waiting.
+            if now - received < min_age:
+                skipped["too_recent"] += 1
+                continue
+            pending.append((m, received))
+
+        # Replies sent outside Outlook (webmail, phone) can land in Sent Items
+        # under a different ConversationID. Count those as answered only when
+        # the subject matches AND the inbound sender is among my message's
+        # recipients, so unrelated mails with a generic subject don't match.
+        candidates: dict[str, list[EmailSummary]] = {}
+        to_check: dict[str, EmailSummary] = {}
+        for m, received in pending:
+            later = [
+                s for s in sent_by_topic.get(normalize_subject(m.subject), [])
+                if _utc(_ts(s)) > received
+            ]
+            if later and m.sender_smtp:
+                candidates[m.entry_id] = later
+                for s in later:
+                    to_check[s.entry_id] = s
+        if to_check:
+            checked = {s.entry_id: s for s in await enrich(list(to_check.values()), attachments=False)}
+            still: list[tuple[EmailSummary, datetime]] = []
+            for m, received in pending:
+                sender = m.sender_smtp.lower()
+                replied = any(
+                    sender in {a.lower() for a in checked[s.entry_id].to_smtp + checked[s.entry_id].cc_smtp}
+                    for s in candidates.get(m.entry_id, [])
+                    if s.entry_id in checked
+                )
+                if replied:
+                    skipped["answered"] += 1
+                else:
+                    still.append((m, received))
+            pending = still
+
+        # 5. Recipients for what is left, then classify.
+        received_at = {m.entry_id: received for m, received in pending}
+        items: list[dict[str, Any]] = []
+        for m in await enrich([m for m, _ in pending], attachments=False):
+            to_l = {a.lower() for a in m.to_smtp}
+            cc_l = {a.lower() for a in m.cc_smtp}
+            addressed = "to_me" if to_l & mine else "cc_me" if cc_l & mine else "other"
+            if addressed == "other" and not params.include_other:
+                skipped["addressed_other"] += 1
+                continue
+            received = received_at[m.entry_id]
+            preview = m.preview or ""
+            if len(preview) > 160:
+                preview = preview[:159].rstrip() + "…"
+            items.append(
+                {
+                    "entry_id": m.entry_id,
+                    "conversation_id": m.conversation_id,
+                    "subject": m.subject,
+                    "sender_name": m.sender_name,
+                    "sender_smtp": m.sender_smtp,
+                    "to_smtp": m.to_smtp,
+                    "addressed": addressed,
+                    "received_utc": received.isoformat(),
+                    "days_waiting": round((now - received).total_seconds() / 86400, 1),
+                    "is_read": m.is_read,
+                    "preview": preview,
+                }
+            )
+        # 6. to_me -> cc_me -> other, oldest first within each group.
+        items.sort(key=lambda r: (_ADDRESSED_ORDER[r["addressed"]], r["received_utc"]))
+        return {
+            "awaiting": items,
+            "count": len(items),
+            "inbound_scanned": len(inbound),
+            "sent_scanned": len(sent),
+            "inbound_truncated": len(inbound) >= params.max_results,
+            "my_addresses": sorted(mine),
+            "skipped": dict(skipped),
+        }
 
     @mcp.tool(
         name="outlook_find_promised_actions",

@@ -110,10 +110,16 @@ class WindowsComBackend(Backend):
             details=False,
         )
 
-    async def enrich_summaries(self, summaries: list[EmailSummary]) -> list[EmailSummary]:
+    async def enrich_summaries(
+        self, summaries: list[EmailSummary], attachments: bool = True
+    ) -> list[EmailSummary]:
+        """attachments=False fills recipients only (has_real_attachments stays
+        False) for callers that do not report attachments."""
         if not summaries:
             return []
-        return await self._bridge.execute(_sync_enrich_summaries, list(summaries))
+        return await self._bridge.execute(
+            _sync_enrich_summaries, list(summaries), attachments=attachments
+        )
 
     async def get_plain_bodies(self, entry_ids: list[str]) -> dict[str, str]:
         if not entry_ids:
@@ -655,12 +661,7 @@ def _extract_summary(item: Any, folder_path: str) -> EmailSummary:
             _remember_conversation(conv_id, item.EntryID)
         except Exception:
             pass
-    try:
-        has_real = any(
-            int(getattr(a, "Type", 0)) in ATTACH_TYPES_REAL for a in item.Attachments
-        )
-    except Exception:
-        has_real = False
+    has_real = _has_real_attachments(item)
     try:
         body_plain = item.Body or ""
     except Exception:
@@ -723,7 +724,7 @@ def _sync_get_emails_in_time_range(
 
 _PT = "http://schemas.microsoft.com/mapi/proptag/"
 _COL_CONVERSATION_ID = _PT + "0x30130102"     # PR_CONVERSATION_ID (binary)
-_COL_HAS_ATTACH = _PT + "0x0E1B000B"          # PR_HASATTACH
+_COL_LONGTERM_ID = _PT + "0x66700102"         # PR_LONGTERM_ENTRYID_FROM_TABLE
 _COL_DELIVERY_TIME = _PT + "0x0E060040"       # PR_MESSAGE_DELIVERY_TIME (UTC)
 _COL_SUBMIT_TIME = _PT + "0x00390040"         # PR_CLIENT_SUBMIT_TIME (UTC)
 _COL_PREVIEW = "urn:schemas:httpmail:textdescription"
@@ -736,7 +737,7 @@ _SUMMARY_COLUMNS = [
     "Importance",
     "MessageClass",
     _COL_CONVERSATION_ID,
-    _COL_HAS_ATTACH,
+    _COL_LONGTERM_ID,
     _COL_DELIVERY_TIME,
     _COL_SUBMIT_TIME,
     _COL_PREVIEW,
@@ -782,11 +783,87 @@ def _iter_table_rows(table: Any, width: int):
             yield tuple(row)
 
 
-def _item_details(item: Any, has_attach: Any) -> tuple[list[str], list[str], bool]:
-    """(to, cc, has_real_attachments) — the parts a table row cannot give."""
+_PR_ATTACHMENT_HIDDEN = _PT + "0x7FFE000B"
+_PR_ATTACH_CONTENT_ID = _PT + "0x3712001F"
+_PR_ATTACH_FLAGS = _PT + "0x37140003"
+_ATT_MHTML_REF = 0x4
+
+
+def _attachment_prop(att: Any, tag: str) -> Any:
+    try:
+        return att.PropertyAccessor.GetProperty(tag)
+    except Exception:
+        return None
+
+
+def _is_inline_attachment(att: Any, html_body: Any) -> bool:
+    """True for attachments that are part of the message body (pasted or
+    signature images referenced as cid:...) or hidden, False for files the
+    sender actually attached. `html_body` is a zero-arg callable so the HTML
+    body is only loaded when the attachment flags are not conclusive."""
+    if int(getattr(att, "Type", 0) or 0) not in ATTACH_TYPES_REAL:
+        return True
+    try:
+        # One COM round trip for all three properties; missing ones come back
+        # as error codes (ints), which the checks below treat as "not set".
+        hidden, content_id, flags = att.PropertyAccessor.GetProperties(
+            (_PR_ATTACHMENT_HIDDEN, _PR_ATTACH_CONTENT_ID, _PR_ATTACH_FLAGS)
+        )
+    except Exception:
+        hidden = _attachment_prop(att, _PR_ATTACHMENT_HIDDEN)
+        content_id = _attachment_prop(att, _PR_ATTACH_CONTENT_ID)
+        flags = _attachment_prop(att, _PR_ATTACH_FLAGS)
+    if hidden is True:
+        return True
+    if not isinstance(content_id, str) or not content_id:
+        return False
+    # Missing properties come back as negative HRESULTs; only trust real flags.
+    if isinstance(flags, int) and not isinstance(flags, bool) and flags >= 0 and flags & _ATT_MHTML_REF:
+        return True
+    return f"cid:{content_id}" in html_body()
+
+
+def _html_loader(item: Any):
+    cache: dict[str, str] = {}
+
+    def load() -> str:
+        if "html" not in cache:
+            try:
+                cache["html"] = item.HTMLBody or ""
+            except Exception:
+                cache["html"] = ""
+        return cache["html"]
+
+    return load
+
+
+def _has_real_attachments(item: Any) -> bool:
+    try:
+        attachments = item.Attachments
+        if int(attachments.Count) == 0:
+            return False
+        html = _html_loader(item)
+        return any(not _is_inline_attachment(a, html) for a in attachments)
+    except Exception:
+        return False
+
+
+def _long_term_id(row_value: Any, fallback: Any) -> str:
+    """Tables return short-term EntryIDs; PR_LONGTERM_ENTRYID_FROM_TABLE gives
+    the same long-term ID as MailItem.EntryID, stable across sessions."""
+    if row_value is not None:
+        try:
+            return bytes(row_value).hex().upper()
+        except Exception:
+            pass
+    return fallback
+
+
+def _item_details(item: Any, attachments: bool = True) -> tuple[list[str], list[str], bool]:
+    """(to, cc, has_real_attachments) — the parts a table row cannot give.
+    attachments=False skips the attachment check (has_real_attachments=False)."""
     to_list: list[str] = []
     cc_list: list[str] = []
-    has_real = False
     try:
         for recip in item.Recipients:
             smtp = resolve_recipient(recip)
@@ -798,20 +875,7 @@ def _item_details(item: Any, has_attach: Any) -> tuple[list[str], list[str], boo
                 to_list.append(smtp)
     except Exception:
         pass
-    if has_attach:
-        try:
-            has_real = any(
-                int(getattr(a, "Type", 0)) in ATTACH_TYPES_REAL for a in item.Attachments
-            )
-        except Exception:
-            has_real = False
-    return to_list, cc_list, has_real
-
-
-# entry_id -> PR_HASATTACH for summaries produced without details, so that
-# enrich_summaries() can skip the attachment check exactly as a full read would.
-_PENDING_HAS_ATTACH: dict[str, bool] = {}
-_PENDING_HAS_ATTACH_MAX = 50_000
+    return to_list, cc_list, (_has_real_attachments(item) if attachments else False)
 
 
 def _summary_from_row(
@@ -824,9 +888,10 @@ def _summary_from_row(
     for just the summaries a caller actually returns.
     """
     (
-        entry_id, subject, sender_name, sender_addr, unread, importance,
-        _message_class, conversation, has_attach, delivered, submitted, preview,
+        short_id, subject, sender_name, sender_addr, unread, importance,
+        _message_class, conversation, long_id, delivered, submitted, preview,
     ) = row
+    entry_id = _long_term_id(long_id, short_id)
     conv_id = _hex_id(conversation)
     if conv_id:
         _remember_conversation(conv_id, entry_id)
@@ -844,13 +909,8 @@ def _summary_from_row(
     to_list: list[str] = []
     cc_list: list[str] = []
     has_real = False
-    if details:
-        if item is not None:
-            to_list, cc_list, has_real = _item_details(item, has_attach)
-    else:
-        if len(_PENDING_HAS_ATTACH) >= _PENDING_HAS_ATTACH_MAX:
-            _PENDING_HAS_ATTACH.clear()
-        _PENDING_HAS_ATTACH[entry_id] = bool(has_attach)
+    if details and item is not None:
+        to_list, cc_list, has_real = _item_details(item)
 
     return EmailSummary(
         entry_id=entry_id,
@@ -904,8 +964,11 @@ def _table_summaries(
     return out
 
 
-def _sync_enrich_summaries(namespace: Any, summaries: list[EmailSummary]) -> list[EmailSummary]:
-    """Fill recipients / has_real_attachments for summaries built with details=False."""
+def _sync_enrich_summaries(
+    namespace: Any, summaries: list[EmailSummary], attachments: bool = True
+) -> list[EmailSummary]:
+    """Fill recipients (and, unless attachments=False, has_real_attachments)
+    for summaries built with details=False."""
     from dataclasses import replace
 
     out: list[EmailSummary] = []
@@ -915,8 +978,7 @@ def _sync_enrich_summaries(namespace: Any, summaries: list[EmailSummary]) -> lis
         except Exception:
             out.append(s)
             continue
-        has_attach = _PENDING_HAS_ATTACH.get(s.entry_id, True)
-        to_list, cc_list, has_real = _item_details(item, has_attach)
+        to_list, cc_list, has_real = _item_details(item, attachments)
         out.append(replace(s, to_smtp=to_list, cc_smtp=cc_list, has_real_attachments=has_real))
     return out
 
@@ -956,14 +1018,20 @@ def _sync_conversation_senders(
         return None
     if conversation is None:
         return None
-    columns = ["EntryID", "SenderEmailAddress", "MessageClass", _COL_DELIVERY_TIME, _COL_SUBMIT_TIME]
+    columns = [
+        "EntryID", "SenderEmailAddress", "MessageClass", _COL_DELIVERY_TIME, _COL_SUBMIT_TIME,
+        _COL_LONGTERM_ID,
+    ]
     table = conversation.GetTable()
     table.Columns.RemoveAll()
     for column in columns:
         table.Columns.Add(column)
     out: list[EmailSummary] = []
     seen: set[str] = set()
-    for entry_id, sender_addr, message_class, delivered, submitted in _iter_table_rows(table, len(columns)):
+    for short_id, sender_addr, message_class, delivered, submitted, long_id in _iter_table_rows(
+        table, len(columns)
+    ):
+        entry_id = _long_term_id(long_id, short_id)
         if not entry_id or entry_id in seen or not _is_mail_class(message_class):
             continue
         seen.add(entry_id)
@@ -1324,7 +1392,8 @@ def _sync_get_email_full_metadata(namespace: Any, entry_id: str) -> EmailFullMet
         raise EmailNotFoundError(f"No email with entry_id {entry_id!r}.") from exc
     folder_path = ""
     try:
-        folder_path = item.Parent.Name if item.Parent else ""
+        parent = item.Parent
+        folder_path = _folder_display_path(parent, parent.Name) if parent else ""
     except Exception:
         folder_path = ""
     summary = _extract_summary(item, folder_path)
@@ -1337,15 +1406,16 @@ def _sync_get_email_full_metadata(namespace: Any, entry_id: str) -> EmailFullMet
     except Exception:
         html = None
     attachments: list[AttachmentInfo] = []
+    html_body = lambda: html or ""  # noqa: E731 - already loaded above
     try:
         for idx, att in enumerate(item.Attachments, start=1):
-            kind = int(getattr(att, "Type", 0))
             attachments.append(
                 AttachmentInfo(
                     index=idx,
                     filename=getattr(att, "FileName", "") or "",
                     size_bytes=int(getattr(att, "Size", 0) or 0),
-                    is_inline=kind not in ATTACH_TYPES_REAL,
+                    # Same rule as summaries' has_real_attachments.
+                    is_inline=_is_inline_attachment(att, html_body),
                 )
             )
     except Exception:

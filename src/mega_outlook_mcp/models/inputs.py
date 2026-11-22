@@ -102,7 +102,10 @@ class ListCalendarEventsInput(_Base):
     end_utc: datetime
     calendar_id: str | None = Field(
         default=None,
-        description="Specific calendar id; defaults to the primary calendar.",
+        description=(
+            "Calendar folder: EntryID, folder path ('//<store>/Kalendarz') or data file "
+            "('//<store>/'); defaults to the primary calendar."
+        ),
     )
     max_results: int = Field(default=200, ge=1, le=1000)
 

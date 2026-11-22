@@ -22,7 +22,7 @@ from ..models.inputs import (
     SummarizeInboxInput,
     ThreadifyInput,
 )
-from ..utils.email_extract import domain_of
+from ..utils.email_extract import domain_of, own_text
 from ..utils.subject_utils import normalize_subject
 
 _IMPORTANCE_RANK = {"low": 0, "normal": 1, "high": 2}
@@ -62,6 +62,83 @@ _PROMISE_PHRASES = (
     "circle back",
     "i'll have",
     "i will have",
+    # Polish (matched on the lower-cased preview; first-person future forms)
+    "wyślę",
+    "prześlę",
+    "podeślę",
+    "przekażę",
+    "odezwę się",
+    "odpiszę",
+    "oddzwonię",
+    "zadzwonię",
+    "dam znać",
+    "dam ci znać",
+    "dam pani znać",
+    "dam panu znać",
+    "dam państwu znać",
+    "sprawdzę",
+    "potwierdzę",
+    "przygotuję",
+    "zajmę się",
+    "dopilnuję",
+    "uzupełnię",
+    "poprawię",
+    "zamówię",
+    "wrócę z",
+    "wrócę do",
+    "do końca dnia",
+    "do końca tygodnia",
+    "najpóźniej do",
+    "postaram się",
+    # more first-person singular commitments
+    "przywiozę",
+    "dowiozę",
+    "zawiozę",
+    "dostarczę",
+    "przyślę",
+    "doślę",
+    "odeślę",
+    "wrzucę",
+    "załączę",
+    "zorganizuję",
+    "załatwię",
+    "ogarnę",
+    "umówię",
+    "zarezerwuję",
+    "wycenię",
+    "przeliczę",
+    "przypomnę",
+    "dopytam",
+    "zapytam",
+    "ustalę",
+    "zrobię",
+    "przejrzę",
+    "zaktualizuję",
+    "naniosę",
+    "podpiszę",
+    "opłacę",
+    "wystawię",
+    "zlecę",
+    "odbiorę",
+    "przyjadę",
+    "podjadę",
+    "skontaktuję się",
+    # first-person plural ("we will …")
+    "wyślemy",
+    "prześlemy",
+    "podeślemy",
+    "przekażemy",
+    "dostarczymy",
+    "przywieziemy",
+    "zorganizujemy",
+    "przygotujemy",
+    "sprawdzimy",
+    "potwierdzimy",
+    "wycenimy",
+    "przeliczymy",
+    "odezwiemy się",
+    "damy znać",
+    "skontaktujemy się",
 )
 
 
@@ -85,6 +162,29 @@ def _utc(dt: datetime) -> datetime:
 
 
 def register(mcp: Any, backend: Backend) -> None:
+    # Optional backend fast paths (Windows COM). Composites list mail without
+    # recipients/attachment details, then fill those in only for the messages
+    # they actually use or return. Backends without them get the full read.
+    async def list_light(start, end, folders, max_results) -> list[EmailSummary]:
+        fn = getattr(backend, "get_emails_in_time_range_light", None)
+        if fn is None:
+            return await backend.get_emails_in_time_range(start, end, folders, max_results)
+        return await fn(start, end, folders, max_results)
+
+    async def enrich(summaries: list[EmailSummary]) -> list[EmailSummary]:
+        fn = getattr(backend, "enrich_summaries", None)
+        if fn is None or not summaries:
+            return summaries
+        return await fn(summaries)
+
+    async def thread_senders(cid: str, anchor_entry_id: str | None) -> list[EmailSummary]:
+        fn = getattr(backend, "get_conversation_senders", None)
+        if fn is not None:
+            found = await fn(cid, anchor_entry_id)
+            if found is not None:
+                return found
+        return await backend.get_conversation_thread(cid, None, max_messages=200)
+
     @mcp.tool(
         name="outlook_summarize_inbox",
         description=(
@@ -105,7 +205,7 @@ def register(mcp: Any, backend: Backend) -> None:
             folders=folders or ["Inbox"],
             max_results=max_results,
         )
-        emails = await backend.get_emails_in_time_range(
+        emails = await list_light(
             params.start_utc, params.end_utc, params.folders, params.max_results
         )
         info = await backend.get_mailbox_info()
@@ -138,13 +238,18 @@ def register(mcp: Any, backend: Backend) -> None:
             else:
                 buckets["read_internal"].append(e)
 
+        top = {
+            k: sorted(v, key=lambda x: _ts(x) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)[:10]
+            for k, v in buckets.items()
+        }
+        enriched = {s.entry_id: s for s in await enrich([s for v in top.values() for s in v])}
         return {
             "window": {"start_utc": params.start_utc.isoformat(), "end_utc": params.end_utc.isoformat()},
             "owner_domain": owner_domain,
             "counts": {k: len(v) for k, v in buckets.items()},
             "top_per_bucket": {
-                k: [_summary_to_json(s) for s in sorted(v, key=lambda x: _ts(x) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)[:10]]
-                for k, v in buckets.items()
+                k: [_summary_to_json(enriched.get(s.entry_id, s)) for s in v]
+                for k, v in top.items()
             },
         }
 
@@ -168,7 +273,8 @@ def register(mcp: Any, backend: Backend) -> None:
             folders=folders or ["Inbox"],
             max_results=max_results,
         )
-        emails = await backend.get_emails_in_time_range(
+        # Output uses no recipient/attachment fields: no enrichment needed.
+        emails = await list_light(
             params.start_utc, params.end_utc, params.folders, params.max_results
         )
         items: list[dict[str, Any]] = []
@@ -220,7 +326,7 @@ def register(mcp: Any, backend: Backend) -> None:
         info = await backend.get_mailbox_info()
         owner_smtp = (info.smtp_address or "").lower()
 
-        sent = await backend.get_emails_in_time_range(
+        sent = await list_light(
             params.start_utc, params.end_utc, ["Sent Items"], params.max_results
         )
         # Latest sent message per conversation_id
@@ -238,13 +344,14 @@ def register(mcp: Any, backend: Backend) -> None:
 
         threshold = timedelta(hours=params.waiting_hours)
         now = datetime.now(timezone.utc)
-        stalled: list[dict[str, Any]] = []
+        stalled_sent: list[EmailSummary] = []
         for cid, s in last_sent.items():
             sent_at = _utc(_ts(s))
             if now - sent_at < threshold:
                 continue
             try:
-                thread = await backend.get_conversation_thread(cid, None, max_messages=200)
+                # Only sender + time of each message are needed here.
+                thread = await thread_senders(cid, s.entry_id)
             except Exception:
                 continue
             inbound_after = [
@@ -254,9 +361,13 @@ def register(mcp: Any, backend: Backend) -> None:
             ]
             if inbound_after:
                 continue
+            stalled_sent.append(s)
+        stalled: list[dict[str, Any]] = []
+        for s in await enrich(stalled_sent):
+            sent_at = _utc(_ts(s))
             stalled.append(
                 {
-                    "conversation_id": cid,
+                    "conversation_id": s.conversation_id,
                     "subject": s.subject,
                     "last_sent_to": s.to_smtp,
                     "last_sent_utc": sent_at.isoformat(),
@@ -287,25 +398,42 @@ def register(mcp: Any, backend: Backend) -> None:
             extra_phrases=extra_phrases or [],
         )
         phrases = list(_PROMISE_PHRASES) + [p.lower() for p in params.extra_phrases]
-        sent = await backend.get_emails_in_time_range(
+        sent = await list_light(
             params.start_utc, params.end_utc, ["Sent Items"], params.max_results
         )
-        results: list[dict[str, Any]] = []
+        # Search the whole message the user wrote (not just the 200-char
+        # preview), without the quoted history of other people's mail.
+        bodies_fn = getattr(backend, "get_plain_bodies", None)
+        bodies = await bodies_fn([s.entry_id for s in sent]) if bodies_fn else {}
+        matched: list[tuple[EmailSummary, list[str], str]] = []
         for s in sent:
-            preview_lower = (s.preview or "").lower()
-            hits = [p for p in phrases if p in preview_lower]
+            body = bodies.get(s.entry_id)
+            text = " ".join((own_text(body) if body is not None else (s.preview or "")).split())
+            text_lower = text.lower()
+            hits = [p for p in phrases if p in text_lower]
             if hits:
-                results.append(
-                    {
-                        "entry_id": s.entry_id,
-                        "conversation_id": s.conversation_id,
-                        "subject": s.subject,
-                        "to_smtp": s.to_smtp,
-                        "sent_utc": s.sent_utc.isoformat() if s.sent_utc else None,
-                        "phrases": hits,
-                        "preview": s.preview,
-                    }
-                )
+                pos = min(text_lower.find(p) for p in hits)
+                start = max(0, pos - 100)
+                context = ("…" if start else "") + text[start : pos + 150].strip()
+                if pos + 150 < len(text):
+                    context += "…"
+                matched.append((s, hits, context))
+        enriched = {e.entry_id: e for e in await enrich([s for s, _, _ in matched])}
+        results: list[dict[str, Any]] = []
+        for s, hits, context in matched:
+            s = enriched.get(s.entry_id, s)
+            results.append(
+                {
+                    "entry_id": s.entry_id,
+                    "conversation_id": s.conversation_id,
+                    "subject": s.subject,
+                    "to_smtp": s.to_smtp,
+                    "sent_utc": s.sent_utc.isoformat() if s.sent_utc else None,
+                    "phrases": hits,
+                    "match_context": context,
+                    "preview": s.preview,
+                }
+            )
         return {"promises": results, "count": len(results)}
 
     @mcp.tool(
@@ -394,9 +522,13 @@ def register(mcp: Any, backend: Backend) -> None:
         info = await backend.get_mailbox_info()
         owner_smtp = (info.smtp_address or "").lower()
         owner_domain = (info.domain or "").lower()
-        emails = await backend.get_emails_in_time_range(
+        emails = await list_light(
             params.start_utc, params.end_utc, params.folders, params.max_results
         )
+        # Recipients matter only for outbound mail; inbound needs the sender.
+        outbound = [e for e in emails if (e.sender_smtp or "").lower() == owner_smtp and owner_smtp]
+        enriched = {e.entry_id: e for e in await enrich(outbound)}
+        emails = [enriched.get(e.entry_id, e) for e in emails]
         stats: dict[str, dict[str, Any]] = defaultdict(
             lambda: {"sent_to": 0, "received_from": 0, "last_contact_utc": None}
         )

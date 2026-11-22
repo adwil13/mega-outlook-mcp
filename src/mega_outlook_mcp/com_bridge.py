@@ -13,13 +13,21 @@ is not thread-safe; that is fixed here.
 from __future__ import annotations
 
 import asyncio
+import logging
 import queue
 import threading
+import time
 from typing import Any, Callable
 
 from .errors import ComBridgeError, OutlookNotRunningError
 
 _SENTINEL_SHUTDOWN = object()
+_log = logging.getLogger(__name__)
+
+
+def _short(args: Any, limit: int = 200) -> str:
+    text = repr(args)
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 class OutlookComBridge:
@@ -94,13 +102,33 @@ class OutlookComBridge:
                 if job is _SENTINEL_SHUTDOWN:
                     break
                 fn, args, kwargs, loop, future = job
+                name = getattr(fn, "__name__", repr(fn))
+                if future.done():
+                    # The caller already gave up (MCP request cancelled or
+                    # timed out): don't spend Outlook time on it.
+                    _log.info("job skip  %s: request was cancelled while queued", name)
+                    continue
+                started = time.monotonic()
+                _log.info(
+                    "job start %s args=%s queue_waiting=%d",
+                    name, _short(args), self._queue.qsize(),
+                )
                 try:
+                    t0 = time.monotonic()
                     namespace = self._ensure_connected(win32com, pythoncom)
+                    connect_s = time.monotonic() - t0
+                    if connect_s > 1.0:
+                        _log.info("job %s: connecting to Outlook took %.1fs", name, connect_s)
                     result = fn(namespace, *args, **kwargs)
+                    _log.info("job done  %s in %.1fs", name, time.monotonic() - started)
                     loop.call_soon_threadsafe(
                         _safe_set_result, future, result
                     )
                 except BaseException as exc:  # noqa: BLE001
+                    _log.warning(
+                        "job fail  %s after %.1fs: %s: %s",
+                        name, time.monotonic() - started, type(exc).__name__, exc,
+                    )
                     loop.call_soon_threadsafe(
                         _safe_set_exception, future, exc
                     )

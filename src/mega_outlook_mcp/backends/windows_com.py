@@ -111,8 +111,9 @@ class WindowsComBackend(Backend):
         folders: list[str],
         max_results: int,
     ) -> list[EmailSummary]:
-        """Like get_emails_in_time_range, but to_smtp/cc_smtp are empty and
-        has_real_attachments is False until passed through enrich_summaries."""
+        """Like get_emails_in_time_range, but has_real_attachments is False and
+        to_smtp/cc_smtp are filled only when the table's To/CC display strings
+        are plain SMTP lists (else empty) until passed through enrich_summaries."""
         return await self._bridge.execute(
             _sync_get_emails_in_time_range, start_utc, end_utc, folders, max_results,
             details=False,
@@ -1033,6 +1034,9 @@ _COL_LONGTERM_ID = _PT + "0x66700102"         # PR_LONGTERM_ENTRYID_FROM_TABLE
 _COL_DELIVERY_TIME = _PT + "0x0E060040"       # PR_MESSAGE_DELIVERY_TIME (UTC)
 _COL_SUBMIT_TIME = _PT + "0x00390040"         # PR_CLIENT_SUBMIT_TIME (UTC)
 _COL_PREVIEW = "urn:schemas:httpmail:textdescription"
+_COL_DISPLAY_TO = _PT + "0x0E04001F"          # PR_DISPLAY_TO ('; '-separated)
+_COL_DISPLAY_CC = _PT + "0x0E03001F"          # PR_DISPLAY_CC
+_TABLE_STRING_LIMIT = 255                     # table string columns are cut here
 _SUMMARY_COLUMNS = [
     "EntryID",
     "Subject",
@@ -1046,6 +1050,8 @@ _SUMMARY_COLUMNS = [
     _COL_DELIVERY_TIME,
     _COL_SUBMIT_TIME,
     _COL_PREVIEW,
+    _COL_DISPLAY_TO,
+    _COL_DISPLAY_CC,
 ]
 
 # conversation_id -> entry_id of one message in it, filled as a side effect
@@ -1195,6 +1201,7 @@ def _summary_from_row(
     (
         short_id, subject, sender_name, sender_addr, unread, importance,
         _message_class, conversation, long_id, delivered, submitted, preview,
+        display_to, display_cc,
     ) = row
     entry_id = _long_term_id(long_id, short_id)
     conv_id = _hex_id(conversation)
@@ -1216,6 +1223,14 @@ def _summary_from_row(
     has_real = False
     if details and item is not None:
         to_list, cc_list, has_real = _item_details(item)
+    elif not details:
+        # Free recipients when the table's display strings are complete SMTP
+        # lists (common on IMAP stores); enrich_summaries(attachments=False)
+        # then skips opening these items. Names or a cut string -> left empty.
+        to_display = _smtp_display_list(display_to)
+        cc_display = _smtp_display_list(display_cc)
+        if to_display is not None and cc_display is not None and (to_display or cc_display):
+            to_list, cc_list = to_display, cc_display
 
     return EmailSummary(
         entry_id=entry_id,
@@ -1237,6 +1252,21 @@ def _summary_from_row(
 
 def _looks_like_smtp(value: Any) -> bool:
     return isinstance(value, str) and "@" in value and "/" not in value
+
+
+def _smtp_display_list(value: Any) -> list[str] | None:
+    """Addresses from a PR_DISPLAY_TO/CC column, or None when it cannot be
+    trusted: a display name instead of an address, or a string at the table
+    column limit (possibly cut). An empty column is an empty list."""
+    if value is None or not isinstance(value, str):
+        return [] if value is None else None
+    if len(value) >= _TABLE_STRING_LIMIT:
+        return None
+    parts = [p.strip().strip("'\"") for p in value.split(";")]
+    parts = [p for p in parts if p]
+    if not all(_looks_like_smtp(p) and " " not in p for p in parts):
+        return None
+    return parts
 
 
 def _table_summaries(
@@ -1278,6 +1308,9 @@ def _sync_enrich_summaries(
 
     out: list[EmailSummary] = []
     for s in summaries:
+        if not attachments and (s.to_smtp or s.cc_smtp):
+            out.append(s)  # recipients already known from the table row
+            continue
         try:
             item = namespace.GetItemFromID(s.entry_id)
         except Exception:

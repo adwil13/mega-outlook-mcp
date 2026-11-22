@@ -368,6 +368,7 @@ _DEFAULT_FOLDER_IDS: dict[str, int] = {
     "deleted": 3,   # olFolderDeletedItems
     "junk": 23,     # olFolderJunk
     "outbox": 4,    # olFolderOutbox
+    "calendar": 9,  # olFolderCalendar
 }
 _API_FOLDER_ALIASES: dict[str, str] = {
     "inbox": "inbox",
@@ -376,6 +377,7 @@ _API_FOLDER_ALIASES: dict[str, str] = {
     "deleted": "deleted", "deleted items": "deleted", "trash": "deleted",
     "junk": "junk", "junk email": "junk", "spam": "junk",
     "outbox": "outbox",
+    "calendar": "calendar",
 }
 _PAREN_SUFFIX_RE = re.compile(r"\s*\([^)]*\)\s*$")
 
@@ -866,6 +868,7 @@ def _sync_list_stores(namespace: Any) -> list[dict[str, Any]]:
         is_default = _safe_attr(store, "StoreID") == default_id
         inbox = _store_default_folder(namespace, store, "inbox")
         sent = _store_default_folder(namespace, store, "sent")
+        calendar = _store_default_folder(namespace, store, "calendar")
         out.append(
             {
                 "display_name": name,
@@ -875,6 +878,10 @@ def _sync_list_stores(namespace: Any) -> list[dict[str, Any]]:
                 "inbox_path": _folder_display_path(inbox, "") if inbox is not None else None,
                 "inbox_items": _folder_item_count(inbox) if inbox is not None else None,
                 "sent_path": _folder_display_path(sent, "") if sent is not None else None,
+                "calendar_path": (
+                    _folder_display_path(calendar, "") if calendar is not None else None
+                ),
+                "calendar_items": _folder_item_count(calendar) if calendar is not None else None,
                 "instant_search": bool(_safe_attr(store, "IsInstantSearchEnabled", False)),
             }
         )
@@ -1881,6 +1888,35 @@ def _extract_calendar_event(item: Any) -> CalendarEvent:
     )
 
 
+_ENTRY_ID_RE = re.compile(r"^[0-9A-Fa-f]{40,}$")
+
+
+def _resolve_calendar(namespace: Any, calendar_id: str | None) -> Any:
+    """Calendar folder from an EntryID, a folder path in the mail-folder
+    syntax ('Kalendarz', '//<store>/Kalendarz') or just a store ('//<store>/'
+    or '//<store>' = that data file's default calendar). None = the default
+    store's calendar."""
+    if not calendar_id or not calendar_id.strip():
+        return namespace.GetDefaultFolder(OL_FOLDER_CALENDAR)
+    value = calendar_id.strip()
+    if _ENTRY_ID_RE.match(value):
+        try:
+            return namespace.GetFolderFromID(value)
+        except Exception:
+            pass  # not a folder EntryID after all; try it as a path
+    token, rest = _split_store_prefix(value)
+    if token is not None and token != "*" and not rest:
+        store = _match_store(namespace, token)
+        folder = _store_default_folder(namespace, store, "calendar")
+        if folder is None:
+            raise FolderNotFoundError(
+                f"Data file {token!r} has no calendar folder. "
+                "Call outlook_list_stores to see each data file's calendar_path."
+            )
+        return folder
+    return _resolve_folder(namespace, value)
+
+
 def _sync_list_calendar_events(
     namespace: Any,
     start_utc: datetime,
@@ -1888,11 +1924,7 @@ def _sync_list_calendar_events(
     calendar_id: str | None,
     max_results: int,
 ) -> list[CalendarEvent]:
-    calendar = (
-        namespace.GetFolderFromID(calendar_id)
-        if calendar_id
-        else namespace.GetDefaultFolder(OL_FOLDER_CALENDAR)
-    )
+    calendar = _resolve_calendar(namespace, calendar_id)
     items = calendar.Items
     try:
         items.IncludeRecurrences = True

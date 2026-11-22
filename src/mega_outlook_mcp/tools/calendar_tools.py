@@ -22,7 +22,13 @@ def _event_to_json(e: CalendarEvent) -> dict[str, Any]:
 def register(mcp: Any, backend: Backend) -> None:
     @mcp.tool(
         name="outlook_list_calendar_events",
-        description="List calendar events whose start falls within [start_utc, end_utc).",
+        description=(
+            "List calendar events whose start falls within [start_utc, end_utc). calendar_id "
+            "defaults to the default mailbox's calendar; it also accepts a folder EntryID, a "
+            "folder path in the same syntax as mail folders (e.g. '//archive/Kalendarz'), or "
+            "just a data file ('//archive/') for that file's default calendar. See "
+            "outlook_list_stores for each data file's calendar_path."
+        ),
     )
     async def outlook_list_calendar_events(
         start_utc: str,

@@ -29,6 +29,7 @@ class FolderInfo:
     item_count: int
     unread_count: int
     parent_path: str | None = None
+    store: str = ""  # data file / mailbox display name (Windows); "" if unknown
 
 
 @dataclass

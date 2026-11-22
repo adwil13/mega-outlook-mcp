@@ -80,6 +80,10 @@ class WindowsComBackend(Backend):
     async def list_folders(self, include_subfolders: bool) -> list[FolderInfo]:
         return await self._bridge.execute(_sync_list_folders, include_subfolders)
 
+    async def list_stores(self) -> list[dict[str, Any]]:
+        """Data files / mailboxes in the profile (optional; feature-detected)."""
+        return await self._bridge.execute(_sync_list_stores)
+
     # ------------------------------------------------------------------
     # Emails
     # ------------------------------------------------------------------
@@ -398,27 +402,174 @@ def _folder_item_count(folder: Any) -> int:
         return 0
 
 
+# --- Stores (data files) -------------------------------------------------------
+#
+# Paths without a prefix address the default store, exactly as before. Other
+# stores (PST archives, additional mailboxes) are addressed as
+# "//<store>/<folder path>", where <store> is the store's display name, a
+# unique fragment of it or of its data-file name; "//*/<path>" means that
+# path in every store that has it. Labels in results use the same syntax, so
+# a returned folder_path can be passed back as a folder.
+
+_STORE_PREFIXES = ("//", "\\\\")
+_STORE_CACHE_TTL_S = 300.0
+_store_cache: dict[str, Any] = {"at": 0.0}
+
+
+def _default_store(namespace: Any) -> Any:
+    try:
+        return namespace.DefaultStore
+    except Exception:
+        return namespace.GetDefaultFolder(OL_FOLDER_INBOX).Store
+
+
+def _list_stores(namespace: Any) -> list[Any]:
+    """All stores in the profile, default store first."""
+    stores: list[Any] = []
+    try:
+        stores = list(namespace.Stores)
+    except Exception:
+        stores = []
+    try:
+        default_id = _default_store(namespace).StoreID
+    except Exception:
+        default_id = None
+    stores.sort(key=lambda s: 0 if _safe_attr(s, "StoreID") == default_id else 1)
+    return stores or [_default_store(namespace)]
+
+
+def _safe_attr(obj: Any, name: str, default: Any = None) -> Any:
+    try:
+        return getattr(obj, name)
+    except Exception:
+        return default
+
+
+def _default_store_name(namespace: Any) -> str:
+    _refresh_store_cache(namespace)
+    return _store_cache.get("default_name", "")
+
+
+def _split_store_prefix(path: str | None) -> tuple[str | None, str]:
+    """'//store/a/b' -> ('store', 'a/b'); 'a/b' -> (None, 'a/b')."""
+    text = (path or "").strip()
+    for prefix in _STORE_PREFIXES:
+        if text.startswith(prefix):
+            body = text[len(prefix):].replace("\\", "/")
+            token, _, rest = body.partition("/")
+            return token.strip(), rest.strip().strip("/")
+    return None, text
+
+
+def _store_file_name(store: Any) -> str:
+    path = _safe_attr(store, "FilePath", "") or ""
+    return path.replace("/", "\\").rsplit("\\", 1)[-1]
+
+
+def _match_store(namespace: Any, token: str) -> Any:
+    stores = _list_stores(namespace)
+    wanted = (token or "").strip().lower()
+
+    def keys(store: Any) -> tuple[str, str, str]:
+        name = (_safe_attr(store, "DisplayName", "") or "").lower()
+        file_name = _store_file_name(store).lower()
+        return name, file_name, file_name.rsplit(".", 1)[0]
+
+    exact = [s for s in stores if wanted and wanted in keys(s)]
+    if len(exact) == 1:
+        return exact[0]
+    partial = [s for s in stores if wanted and any(wanted in k for k in keys(s) if k)]
+    if len(partial) == 1:
+        return partial[0]
+    available = ", ".join(repr(_safe_attr(s, "DisplayName", "?")) for s in stores)
+    problem = "matches several stores" if len(partial) > 1 else "matches no store"
+    raise FolderNotFoundError(
+        f"Store {token!r} {problem}. Available stores: {available}. "
+        "Address a store as '//<store>/<folder>' (e.g. '//archive/Inbox') "
+        "or use '//*/<folder>' for all stores."
+    )
+
+
+def _is_visible_folder(folder: Any) -> bool:
+    # Some PST archives report hidden/orphaned folders as their defaults;
+    # those have no "\\store\path" FolderPath.
+    return str(_safe_attr(folder, "FolderPath", "") or "").startswith("\\\\")
+
+
+def _refresh_store_cache(namespace: Any) -> None:
+    if time.monotonic() - _store_cache["at"] < _STORE_CACHE_TTL_S:
+        return
+    names: dict[str, str] = {}
+    # Default store first so its names win on conflicts.
+    for kind, folder_id in _DEFAULT_FOLDER_IDS.items():
+        try:
+            names.setdefault(_norm_name(namespace.GetDefaultFolder(folder_id).Name), kind)
+        except Exception:
+            continue
+    for store in _list_stores(namespace):
+        for kind, folder_id in _DEFAULT_FOLDER_IDS.items():
+            try:
+                folder = store.GetDefaultFolder(folder_id)
+                if _is_visible_folder(folder):
+                    names.setdefault(_norm_name(folder.Name), kind)
+            except Exception:
+                continue
+    _store_cache.update(
+        at=time.monotonic(),
+        names=names,
+        default_name=_safe_attr(_default_store(namespace), "DisplayName", "") or "",
+    )
+
+
+def _store_default_folder(namespace: Any, store: Any, kind: str) -> Any | None:
+    """The well-known folder `kind` of `store`; by name when the store's own
+    default-folder pointers are missing or hidden (common in PST archives)."""
+    try:
+        if store.StoreID == _default_store(namespace).StoreID:
+            return namespace.GetDefaultFolder(_DEFAULT_FOLDER_IDS[kind])
+    except Exception:
+        pass
+    try:
+        folder = store.GetDefaultFolder(_DEFAULT_FOLDER_IDS[kind])
+        if _is_visible_folder(folder):
+            return folder
+    except Exception:
+        pass
+    wanted = {name for name, k in _localized_default_names(namespace).items() if k == kind}
+    wanted |= {alias for alias, k in _API_FOLDER_ALIASES.items() if k == kind}
+    try:
+        for folder in store.GetRootFolder().Folders:
+            if _norm_name(folder.Name) in wanted:
+                return folder
+    except Exception:
+        pass
+    return None
+
+
 def _folder_display_path(folder: Any, fallback: str) -> str:
-    """Path as outlook_list_folders shows it, e.g. '[Gmail]/Wysłane'."""
+    """Path as outlook_list_folders shows it: '[Gmail]/Wysłane' in the default
+    store, '//<store>/Wysłane elementy' in any other store."""
     try:
         raw = folder.FolderPath  # "\\\\store\\[Gmail]\\Wysłane"
         parts = [p for p in raw.split("\\") if p]
         if len(parts) >= 2:
-            return "/".join(parts[1:])
+            inner = "/".join(parts[1:])
+            default_name = _store_cache.get("default_name") or _safe_attr(
+                _safe_attr(_safe_attr(folder, "Session"), "DefaultStore"), "DisplayName", ""
+            ) or ""
+            if default_name and parts[0] != default_name:
+                return f"//{parts[0]}/{inner}"
+            return inner
     except Exception:
         pass
     return fallback
 
 
 def _localized_default_names(namespace: Any) -> dict[str, str]:
-    """{normalized localized name: kind}, read from this Outlook install."""
-    names: dict[str, str] = {}
-    for kind, folder_id in _DEFAULT_FOLDER_IDS.items():
-        try:
-            names.setdefault(_norm_name(namespace.GetDefaultFolder(folder_id).Name), kind)
-        except Exception:
-            continue
-    return names
+    """{normalized localized name: kind}, read from every store in this
+    Outlook profile (cached for a few minutes)."""
+    _refresh_store_cache(namespace)
+    return _store_cache.get("names", {})
 
 
 def _folder_kind(namespace: Any, path: str) -> str | None:
@@ -445,12 +596,73 @@ def _is_sent_folder(namespace: Any, folder: Any, requested: str, label: str) -> 
     except Exception:
         return False
     try:
-        return namespace.GetDefaultFolder(_DEFAULT_FOLDER_IDS["sent"]).EntryID == entry_id
+        if namespace.GetDefaultFolder(_DEFAULT_FOLDER_IDS["sent"]).EntryID == entry_id:
+            return True
+    except Exception:
+        pass
+    try:
+        own = folder.Store.GetDefaultFolder(_DEFAULT_FOLDER_IDS["sent"])
+        return _is_visible_folder(own) and own.EntryID == entry_id
     except Exception:
         return False
 
 
+def _resolve_in_store(namespace: Any, store: Any, path: str, original: str) -> Any:
+    """Folder `path` inside `store`: the exact path first, then a well-known
+    folder name (API word or any localized name)."""
+    if path:
+        folder = _walk_path(store.GetRootFolder(), path)
+        if folder is not None:
+            return folder
+    kind = _folder_kind(namespace, path) if path else None
+    if kind is not None:
+        folder = _store_default_folder(namespace, store, kind)
+        if folder is not None:
+            return folder
+    raise FolderNotFoundError(
+        f"Folder {original!r} not found. Call outlook_list_folders to see available folders."
+    )
+
+
+def _resolve_folder_specs(namespace: Any, folders: list[str]) -> list[tuple[Any, str]]:
+    """Resolve folder specs to (folder, requested spec) pairs; '//*/<path>'
+    expands to that path in every store that has it."""
+    out: list[tuple[Any, str]] = []
+    seen: set[str] = set()
+    for spec in folders:
+        token, rest = _split_store_prefix(spec)
+        if token == "*":
+            resolved = []
+            for store in _list_stores(namespace):
+                try:
+                    resolved.append(_resolve_in_store(namespace, store, rest, spec))
+                except FolderNotFoundError:
+                    continue
+            if not resolved:
+                raise FolderNotFoundError(
+                    f"Folder {spec!r} not found in any store. "
+                    "Call outlook_list_folders to see available folders."
+                )
+        else:
+            resolved = [_resolve_folder(namespace, spec)]
+        for folder in resolved:
+            key = _safe_attr(folder, "EntryID", None) or id(folder)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((folder, spec))
+    return out
+
+
 def _resolve_folder(namespace: Any, path: str) -> Any:
+    token, rest = _split_store_prefix(path)
+    if token is not None:
+        if token == "*":
+            raise FolderNotFoundError(
+                f"{path!r}: '//*/...' (all stores) is only accepted where a list of folders is."
+            )
+        return _resolve_in_store(namespace, _match_store(namespace, token), rest, path)
+
     try:
         root = namespace.GetDefaultFolder(OL_FOLDER_INBOX).Parent
     except Exception:
@@ -595,11 +807,16 @@ def _sync_get_mailbox_info(namespace: Any) -> MailboxInfo:
 
 
 def _sync_list_folders(namespace: Any, include_subfolders: bool) -> list[FolderInfo]:
+    """Folders of every store; the default store's paths are unprefixed (as
+    before), other stores' paths start with '//<store>/'."""
     results: list[FolderInfo] = []
+    _refresh_store_cache(namespace)
+    store_name = ""
+    top_prefix = ""
 
     def walk(folder: Any, parent_path: str | None) -> None:
         name = folder.Name
-        full_path = name if parent_path is None else f"{parent_path}/{name}"
+        full_path = f"{top_prefix}{name}" if parent_path is None else f"{parent_path}/{name}"
         try:
             item_count = int(folder.Items.Count)
         except Exception:
@@ -615,6 +832,7 @@ def _sync_list_folders(namespace: Any, include_subfolders: bool) -> list[FolderI
                 item_count=item_count,
                 unread_count=unread_count,
                 parent_path=parent_path,
+                store=store_name,
             )
         )
         if not include_subfolders:
@@ -622,10 +840,45 @@ def _sync_list_folders(namespace: Any, include_subfolders: bool) -> list[FolderI
         for sub in folder.Folders:
             walk(sub, full_path)
 
-    root = namespace.GetDefaultFolder(OL_FOLDER_INBOX).Parent
-    for folder in root.Folders:
-        walk(folder, None)
+    default_id = _safe_attr(_default_store(namespace), "StoreID")
+    for store in _list_stores(namespace):
+        store_name = _safe_attr(store, "DisplayName", "") or ""
+        is_default = _safe_attr(store, "StoreID") == default_id
+        top_prefix = "" if is_default else f"//{store_name}/"
+        try:
+            root = (
+                namespace.GetDefaultFolder(OL_FOLDER_INBOX).Parent
+                if is_default
+                else store.GetRootFolder()
+            )
+            for folder in root.Folders:
+                walk(folder, None)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("list_folders skipped store %r: %s", store_name, exc)
     return results
+
+
+def _sync_list_stores(namespace: Any) -> list[dict[str, Any]]:
+    default_id = _safe_attr(_default_store(namespace), "StoreID")
+    out: list[dict[str, Any]] = []
+    for store in _list_stores(namespace):
+        name = _safe_attr(store, "DisplayName", "") or ""
+        is_default = _safe_attr(store, "StoreID") == default_id
+        inbox = _store_default_folder(namespace, store, "inbox")
+        sent = _store_default_folder(namespace, store, "sent")
+        out.append(
+            {
+                "display_name": name,
+                "is_default": is_default,
+                "folder_prefix": "" if is_default else f"//{name}/",
+                "data_file": _safe_attr(store, "FilePath", "") or "",
+                "inbox_path": _folder_display_path(inbox, "") if inbox is not None else None,
+                "inbox_items": _folder_item_count(inbox) if inbox is not None else None,
+                "sent_path": _folder_display_path(sent, "") if sent is not None else None,
+                "instant_search": bool(_safe_attr(store, "IsInstantSearchEnabled", False)),
+            }
+        )
+    return out
 
 
 def _extract_summary(item: Any, folder_path: str) -> EmailSummary:
@@ -692,25 +945,66 @@ def _sync_get_emails_in_time_range(
     max_results: int,
     details: bool = True,
 ) -> list[EmailSummary]:
-    results: list[EmailSummary] = []
-    for folder_name in folders:
-        folder = _resolve_folder(namespace, folder_name)
+    def read(folder: Any, folder_name: str, limit: int, with_details: bool) -> list[EmailSummary]:
         folder_label = _folder_display_path(folder, folder_name)
         field = "SentOn" if _is_sent_folder(namespace, folder, folder_name, folder_label) else "ReceivedTime"
         restrict = build_time_range_restrict(field, start_utc, end_utc)
         try:
-            results.extend(
-                _table_summaries(
-                    namespace, folder, restrict, field, max_results - len(results), folder_label,
-                    details,
-                )
+            return _table_summaries(
+                namespace, folder, restrict, field, limit, folder_label, with_details
             )
         except Exception as exc:
             raise EmailNotFoundError(
                 f"Restrict failed on {folder_name!r}: {exc}"
             ) from exc
-        if len(results) >= max_results:
+
+    return _collect_summaries(
+        namespace, _resolve_folder_specs(namespace, folders), read, max_results, details
+    )
+
+
+def _summary_time(s: EmailSummary) -> datetime:
+    return s.received_utc or s.sent_utc or datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _collect_summaries(
+    namespace: Any,
+    pairs: list[tuple[Any, str]],
+    read: Any,
+    max_results: int,
+    details: bool,
+) -> list[EmailSummary]:
+    """Read resolved folders up to max_results.
+
+    Plain folder specs are read one after another, as before. The folders a
+    single '//*/<path>' spec expanded to (one per store) are read without
+    details, merged newest-first and cut to the remaining limit, and only the
+    kept messages get details, so every store gets a fair share and no time
+    is spent on messages that are dropped.
+    """
+    import itertools
+
+    results: list[EmailSummary] = []
+    for spec, group_iter in itertools.groupby(pairs, key=lambda p: p[1]):
+        group = [folder for folder, _ in group_iter]
+        remaining = max_results - len(results)
+        if remaining <= 0:
             break
+        if _split_store_prefix(spec)[0] != "*":
+            for folder in group:
+                remaining = max_results - len(results)
+                if remaining <= 0:
+                    break
+                results.extend(read(folder, spec, remaining, details))
+            continue
+        pool: list[EmailSummary] = []
+        for folder in group:
+            pool.extend(read(folder, spec, remaining, False))
+        pool.sort(key=_summary_time, reverse=True)
+        chosen = pool[:remaining]
+        if details:
+            chosen = _sync_enrich_summaries(namespace, chosen)
+        results.extend(chosen)
     return results
 
 
@@ -1187,19 +1481,27 @@ _ANCHOR_SEARCH_BUDGET_S = 20.0
 def _find_conversation_anchor(
     namespace: Any, target: str, topic: str, deadline: float
 ) -> str | None:
-    """EntryID of one message in conversation `target`, from Inbox/Sent tables."""
+    """EntryID of one message in conversation `target`, from the Inbox/Sent
+    tables of the default store first, then of the other stores."""
     budget_end = min(deadline, time.monotonic() + _ANCHOR_SEARCH_BUDGET_S)
     table_filter = ""
     if topic:
         table_filter = (
             f'@SQL="{_PR_CONVERSATION_TOPIC}" = \'{topic.replace(chr(39), chr(39) * 2)}\''
         )
-    for folder_id, sort_field in (
-        (OL_FOLDER_INBOX, "ReceivedTime"),
-        (_DEFAULT_FOLDER_IDS["sent"], "SentOn"),
-    ):
+    candidates: list[tuple[Any, str]] = []
+    for store in _list_stores(namespace):
+        for kind, sort_field in (("inbox", "ReceivedTime"), ("sent", "SentOn")):
+            candidates.append((lambda s=store, k=kind: _store_default_folder(namespace, s, k), sort_field))
+    for get_folder, sort_field in candidates:
+        if time.monotonic() > budget_end:
+            return None
+        folder_id = sort_field
         try:
-            folder = namespace.GetDefaultFolder(folder_id)
+            folder = get_folder()
+            if folder is None:
+                continue
+            folder_id = _folder_display_path(folder, sort_field)
             try:
                 table = folder.GetTable(table_filter, _OL_USER_ITEMS)
             except Exception:
@@ -1503,9 +1805,7 @@ def _sync_search_emails(
             return f"@SQL={body}"
         return f"@SQL=({subject} OR {sender} OR {body})"
 
-    results: list[EmailSummary] = []
-    for folder_name in folders:
-        folder = _resolve_folder(namespace, folder_name)
+    def read(folder: Any, folder_name: str, limit: int, with_details: bool) -> list[EmailSummary]:
         folder_label = _folder_display_path(folder, folder_name)
         use_index = False
         if field not in ("subject", "sender"):
@@ -1513,24 +1813,25 @@ def _sync_search_emails(
                 use_index = bool(folder.Store.IsInstantSearchEnabled)
             except Exception:
                 use_index = False
-        remaining = max_results - len(results)
         try:
-            found = _table_summaries(
-                namespace, folder, build(use_index), "ReceivedTime", remaining, folder_label
+            return _table_summaries(
+                namespace, folder, build(use_index), "ReceivedTime", limit, folder_label,
+                with_details,
             )
         except Exception:
             if not use_index:
-                continue
+                return []
             try:
-                found = _table_summaries(
-                    namespace, folder, build(False), "ReceivedTime", remaining, folder_label
+                return _table_summaries(
+                    namespace, folder, build(False), "ReceivedTime", limit, folder_label,
+                    with_details,
                 )
             except Exception:
-                continue
-        results.extend(found)
-        if len(results) >= max_results:
-            break
-    return results
+                return []
+
+    return _collect_summaries(
+        namespace, _resolve_folder_specs(namespace, folders), read, max_results, True
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1951,6 +2252,13 @@ def _sync_move_email(namespace: Any, entry_id: str, destination_folder: str) -> 
         return OperationResult(ok=False, message=f"move failed: {exc}")
 
 
+def _item_store_folder(namespace: Any, item: Any, kind: str) -> Any | None:
+    try:
+        return _store_default_folder(namespace, item.Parent.Store, kind)
+    except Exception:
+        return None
+
+
 def _sync_delete_email(namespace: Any, entry_id: str, permanent: bool) -> OperationResult:
     try:
         item = namespace.GetItemFromID(entry_id)
@@ -1960,7 +2268,11 @@ def _sync_delete_email(namespace: Any, entry_id: str, permanent: bool) -> Operat
         if permanent:
             item.Delete()
             return OperationResult(ok=True, message="permanently deleted")
-        deleted = namespace.GetDefaultFolder(OL_FOLDER_DELETED)
+        # Deleted Items of the store the message lives in (a PST archive's own
+        # trash, not the default mailbox's).
+        deleted = _item_store_folder(namespace, item, "deleted") or namespace.GetDefaultFolder(
+            OL_FOLDER_DELETED
+        )
         item.Move(deleted)
         return OperationResult(ok=True, message="moved to Deleted Items")
     except Exception as exc:
@@ -1973,7 +2285,9 @@ def _sync_junk_email(namespace: Any, entry_id: str) -> OperationResult:
     except Exception as exc:
         raise EmailNotFoundError(f"No email with entry_id {entry_id!r}.") from exc
     try:
-        junk = namespace.GetDefaultFolder(OL_FOLDER_JUNK)
+        junk = _item_store_folder(namespace, item, "junk") or namespace.GetDefaultFolder(
+            OL_FOLDER_JUNK
+        )
         item.Move(junk)
         return OperationResult(ok=True, message="moved to Junk")
     except Exception as exc:

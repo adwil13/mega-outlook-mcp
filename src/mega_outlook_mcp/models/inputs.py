@@ -161,6 +161,22 @@ class FindUnansweredInput(_Base):
     max_results: int = Field(default=200, ge=1, le=1000)
 
 
+class FindAwaitingMyReplyInput(_Base):
+    start_utc: datetime = Field(description="Earliest inbound message to consider.")
+    end_utc: datetime
+    min_age_hours: int = Field(
+        default=24, ge=0, le=8760,
+        description="Skip inbound messages younger than this (hours since received).",
+    )
+    include_other: bool = Field(
+        default=True,
+        description="Include threads where none of my addresses is in To/CC (Bcc, lists).",
+    )
+    max_results: int = Field(
+        default=2000, ge=1, le=5000, description="Max inbound messages scanned."
+    )
+
+
 class FindPromisedActionsInput(_Base):
     start_utc: datetime
     end_utc: datetime
